@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 mod components;
 mod page_data;
 pub mod pages;

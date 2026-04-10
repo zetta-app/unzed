@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports, unused_variables)]
+
 use anyhow::Result;
 use client::{Client, EditPredictionUsage, NeedsLlmTokenRefresh, UserStore, global_llm_token};
 use cloud_api_client::LlmApiToken;
@@ -780,19 +782,9 @@ impl EditPredictionStore {
         })
         .detach();
 
-        let mut current_user = user_store.read(cx).watch_current_user();
-        let fetch_experiments_task = cx.spawn(async move |this, cx| {
-            while current_user.borrow().is_none() {
-                current_user.next().await;
-            }
-
-            this.update(cx, |this, cx| {
-                if cx.is_staff() {
-                    this.refresh_available_experiments(cx);
-                }
-            })
-            .log_err();
-        });
+        let mut _current_user = user_store.read(cx).watch_current_user();
+        // Cloud experiments fetch disabled for privacy
+        let fetch_experiments_task = Task::ready(());
 
         let credentials_provider = zed_credentials_provider::global(cx);
 
@@ -3037,8 +3029,9 @@ impl Dismissable for ZedPredictUpsell {
     }
 }
 
-pub fn should_show_upsell_modal(cx: &App) -> bool {
-    !ZedPredictUpsell::dismissed(cx)
+pub fn should_show_upsell_modal(_cx: &App) -> bool {
+    // Zed AI cloud provider removed for privacy
+    false
 }
 
 pub fn init(cx: &mut App) {

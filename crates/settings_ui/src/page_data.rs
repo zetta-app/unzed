@@ -73,7 +73,6 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         debugger_page(),
         terminal_page(),
         version_control_page(),
-        collaboration_page(),
         ai_page(cx),
         network_page(),
     ]
@@ -373,8 +372,6 @@ fn general_page() -> SettingsPage {
             security_section(),
             workspace_restoration_section(),
             scoped_settings_section(),
-            privacy_section(),
-            auto_update_section(),
         ),
     }
 }

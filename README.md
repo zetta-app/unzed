@@ -1,46 +1,63 @@
-# Zed
+# UnZed
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
-
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+A privacy-oriented fork of [Zed](https://github.com/zed-industries/zed), the high-performance code editor. This fork removes all telemetry, crash reporting, cloud services, and phone-home behavior. No data leaves your machine unless you explicitly configure a third-party service.
 
 ---
 
-### Installation
+## What changed
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+### Removed
+- **Telemetry** — all event tracking, usage metrics, and diagnostics reporting gutted. The `telemetry::event!()` macro is a no-op.
+- **Crash reporting** — Sentry minidump uploads removed. Local crash dumps still written for your own debugging.
+- **Auto-update** — version check polling against zed.dev disabled. Default set to off.
+- **Collaboration** — sign-in, WebSocket connections to zed.dev, and cloud connections disabled. Sign In button and collab panel hidden.
+- **Zed AI edit predictions** — cloud-based Zed/Mercury prediction providers disabled. Upsell modal suppressed.
+- **Settings UI sections** — Privacy (telemetry toggles) and Collaboration pages removed from the settings GUI.
+- **Tracking headers** — `x-zed-system-id` and `x-zed-metrics-id` stripped from all requests.
+- **Tracking query params** — `metrics_id`, `system_id`, `is_staff` removed from update and LLM token requests.
 
-Other platforms are not yet available:
+### Kept
+- **Ollama** edit predictions (fully local, `localhost:11434`)
+- **OpenAI-compatible API** edit predictions (connects to your configured URL)
+- **Copilot** and **Codestral** edit predictions (connect to GitHub/Mistral, not zed.dev)
+- **All language model providers** (Ollama, OpenAI, Anthropic, etc. — user-configured)
+- **Extension downloads** from the Zed extension registry
+- **All editor features** — LSP, terminal, git, debugging, search, etc.
+- **Local hang monitoring** — writes traces to disk for debugging, never uploads
 
-- Web ([tracking issue](https://github.com/zed-industries/zed/issues/5396))
+### Default settings changed
+| Setting | Upstream | This fork |
+|---------|----------|-----------|
+| `telemetry.diagnostics` | `true` | `false` |
+| `telemetry.metrics` | `true` | `false` |
+| `auto_update` | `true` | `false` |
+| `edit_predictions.provider` | `"zed"` | `"none"` |
+| `title_bar.show_sign_in` | `true` | `false` |
+| `collaboration_panel.button` | `true` | `false` |
 
-### Developing Zed
+## Building
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+### System dependencies (Linux)
 
-### Contributing
+```
+sudo apt install libglib2.0-dev libgtk-3-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+  libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libfontconfig-dev \
+  libvulkan-dev libssl-dev
+```
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+### Build
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+```
+cargo build -p zed --release
+```
 
-### Licensing
+The binary will be at `target/release/zed`.
 
-License information for third party dependencies must be correctly provided for CI to pass.
+## Detailed changelog
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+See [PRIVACY_CHANGES.md](./PRIVACY_CHANGES.md) for the full list of modified files and technical details.
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+## Upstream
 
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+Based on [Zed](https://github.com/zed-industries/zed) by Zed Industries, Inc. Licensed under GPL-3.0-or-later / Apache-2.0 / AGPL-3.0-or-later (see LICENSE files).

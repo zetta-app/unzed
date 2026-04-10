@@ -2924,7 +2924,6 @@ dependencies = [
  "paths",
  "postage",
  "rand 0.9.2",
- "regex",
  "release_channel",
  "rpc",
  "rustls-pki-types",
@@ -2933,9 +2932,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "settings",
- "sha2",
  "smol",
- "telemetry",
  "telemetry_events",
  "text",
  "thiserror 2.0.17",
@@ -17474,12 +17471,6 @@ dependencies = [
 [[package]]
 name = "telemetry"
 version = "0.1.0"
-dependencies = [
- "futures 0.3.32",
- "serde",
- "serde_json",
- "telemetry_events",
-]
 
 [[package]]
 name = "telemetry_events"
@@ -22276,7 +22267,6 @@ dependencies = [
  "task",
  "tasks_ui",
  "telemetry",
- "telemetry_events",
  "tempfile",
  "terminal_view",
  "theme",
@@ -22303,7 +22293,6 @@ dependencies = [
  "windows 0.61.3",
  "winresource",
  "workspace",
- "zed-reqwest",
  "zed_actions",
  "zed_env_vars",
  "zlog",
