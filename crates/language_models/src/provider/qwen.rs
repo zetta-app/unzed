@@ -288,6 +288,10 @@ impl LanguageModel for QwenLanguageModel {
         true
     }
 
+    fn supports_split_token_display(&self) -> bool {
+        true
+    }
+
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
         self.supports_tools()
     }
