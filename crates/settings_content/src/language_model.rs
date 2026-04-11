@@ -20,6 +20,7 @@ pub struct AllLanguageModelSettingsContent {
     pub open_router: Option<OpenRouterSettingsContent>,
     pub openai: Option<OpenAiSettingsContent>,
     pub openai_compatible: Option<HashMap<Arc<str>, OpenAiCompatibleSettingsContent>>,
+    pub qwen: Option<QwenSettingsContent>,
     pub vercel: Option<VercelSettingsContent>,
     pub vercel_ai_gateway: Option<VercelAiGatewaySettingsContent>,
     pub x_ai: Option<XAiSettingsContent>,
@@ -461,6 +462,59 @@ pub enum DataCollection {
     #[default]
     Allow,
     Disallow,
+}
+
+#[with_fallible_options]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct QwenSettingsContent {
+    pub api_url: Option<String>,
+    pub available_models: Option<Vec<QwenAvailableModel>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct QwenAvailableModel {
+    /// The model name sent to the API (e.g. "qwen3-235b-a22b", "qwen3-coder-plus").
+    pub name: String,
+    /// The model's name in Zed's UI.
+    pub display_name: Option<String>,
+    /// The model's context window size.
+    pub max_tokens: u64,
+    /// Maximum number of output tokens.
+    pub max_output_tokens: Option<u64>,
+    /// Maximum number of completion tokens (used by some OpenAI-compatible APIs).
+    pub max_completion_tokens: Option<u64>,
+    /// Whether to enable thinking mode for this model.
+    pub enable_thinking: Option<bool>,
+    /// Maximum number of tokens for the thinking process.
+    pub thinking_budget: Option<u64>,
+    /// Model capabilities.
+    #[serde(default)]
+    pub capabilities: QwenModelCapabilities,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct QwenModelCapabilities {
+    /// Whether the model supports tool calling.
+    pub tools: bool,
+    /// Whether the model supports image inputs.
+    pub images: bool,
+    /// Whether the model supports thinking/reasoning mode.
+    pub thinking: bool,
+    /// Whether the model supports parallel tool calls in a single response.
+    pub parallel_tool_calls: bool,
+}
+
+impl Default for QwenModelCapabilities {
+    fn default() -> Self {
+        Self {
+            tools: true,
+            images: false,
+            thinking: true,
+            parallel_tool_calls: false,
+        }
+    }
 }
 
 fn default_true() -> bool {

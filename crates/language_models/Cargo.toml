@@ -50,6 +50,7 @@ ollama = { workspace = true, features = ["schemars"] }
 open_ai = { workspace = true, features = ["schemars"] }
 opencode = { workspace = true, features = ["schemars"] }
 open_router = { workspace = true, features = ["schemars"] }
+qwen = { workspace = true, features = ["schemars"] }
 release_channel.workspace = true
 schemars.workspace = true
 serde.workspace = true

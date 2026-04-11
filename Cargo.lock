@@ -9462,6 +9462,7 @@ dependencies = [
  "open_router",
  "opencode",
  "pretty_assertions",
+ "qwen",
  "release_channel",
  "schemars",
  "serde",
@@ -13848,6 +13849,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce25767e7b499d1b604768e7cde645d14cc8584231ea6b295e9c9eb22c02e1d1"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "qwen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "http_client",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
