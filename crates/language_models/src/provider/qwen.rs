@@ -170,14 +170,31 @@ impl LanguageModelProvider for QwenLanguageModelProvider {
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
+        let settings = Self::settings(cx);
+        let settings_by_name: HashMap<&str, &AvailableModel> = settings
+            .available_models
+            .iter()
+            .map(|m| (m.name.as_str(), m))
+            .collect();
+
         let mut models = BTreeMap::default();
 
-        models.insert("qwen3-235b-a22b", (qwen::Model::Qwen3_235B, None));
-        models.insert("qwen3-32b", (qwen::Model::Qwen3_32B, None));
-        models.insert("qwen3-coder-plus", (qwen::Model::Qwen3CoderPlus, None));
-        models.insert("qwen-plus", (qwen::Model::QwenPlus, None));
+        let builtins: Vec<(&str, qwen::Model)> = vec![
+            ("qwen3-235b-a22b", qwen::Model::Qwen3_235B),
+            ("qwen3-32b", qwen::Model::Qwen3_32B),
+            ("qwen3-coder-plus", qwen::Model::Qwen3CoderPlus),
+            ("qwen-plus", qwen::Model::QwenPlus),
+        ];
 
-        for available_model in Self::settings(cx).available_models.iter() {
+        for (name, model) in builtins {
+            let settings_model = settings_by_name.get(name).copied();
+            models.insert(name, (model, settings_model));
+        }
+
+        for available_model in settings.available_models.iter() {
+            if models.contains_key(available_model.name.as_str()) {
+                continue;
+            }
             models.insert(
                 &available_model.name,
                 (
@@ -307,12 +324,7 @@ impl LanguageModel for QwenLanguageModel {
         self.settings_model
             .as_ref()
             .and_then(|m| m.enable_thinking)
-            .unwrap_or_else(|| {
-                self.settings_model
-                    .as_ref()
-                    .map(|m| m.capabilities.thinking)
-                    .unwrap_or_else(|| self.model.supports_thinking())
-            })
+            .unwrap_or(false)
     }
 
     fn telemetry_id(&self) -> String {
@@ -458,13 +470,11 @@ pub fn into_qwen(
         }
     }
 
-    let supports_thinking = settings_model
-        .and_then(|m| m.enable_thinking)
-        .unwrap_or_else(|| {
-            settings_model
-                .map(|m| m.capabilities.thinking)
-                .unwrap_or_else(|| model.supports_thinking())
-        });
+    // Only send enable_thinking when explicitly configured in settings.
+    // Local servers (llama.cpp, vLLM) typically don't support this parameter
+    // and will ignore it, causing the model to dump thinking into regular content.
+    // The DashScope cloud API supports it natively.
+    let explicit_thinking = settings_model.and_then(|m| m.enable_thinking);
 
     let thinking_budget = settings_model.and_then(|m| m.thinking_budget);
     let max_completion_tokens = settings_model.and_then(|m| m.max_completion_tokens);
@@ -493,14 +503,12 @@ pub fn into_qwen(
         stream_options: Some(qwen::StreamOptions {
             include_usage: true,
         }),
-        enable_thinking: if supports_thinking && request.thinking_allowed {
+        enable_thinking: if explicit_thinking == Some(true) && request.thinking_allowed {
             Some(true)
-        } else if supports_thinking {
-            Some(false)
         } else {
             None
         },
-        thinking_budget: if supports_thinking && request.thinking_allowed {
+        thinking_budget: if explicit_thinking == Some(true) && request.thinking_allowed {
             thinking_budget
         } else {
             None
@@ -562,10 +570,12 @@ impl QwenEventMapper {
         }
 
         if let Some(reasoning_content) = choice.delta.reasoning_content.clone() {
-            events.push(Ok(LanguageModelCompletionEvent::Thinking {
-                text: reasoning_content,
-                signature: None,
-            }));
+            if !reasoning_content.is_empty() {
+                events.push(Ok(LanguageModelCompletionEvent::Thinking {
+                    text: reasoning_content,
+                    signature: None,
+                }));
+            }
         }
 
         if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
