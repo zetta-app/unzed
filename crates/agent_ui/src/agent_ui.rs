@@ -728,6 +728,7 @@ mod tests {
             new_thread_location: Default::default(),
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            context_compact: Default::default(),
         };
 
         cx.update(|cx| {

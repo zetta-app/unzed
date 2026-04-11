@@ -375,6 +375,7 @@ impl NativeAgent {
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
+            cx.subscribe(&thread_handle, Self::handle_thread_context_compacted),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
             }),
@@ -688,6 +689,22 @@ impl NativeAgent {
         };
         session.acp_thread.update(cx, |acp_thread, cx| {
             acp_thread.update_token_usage(usage.0.clone(), cx);
+        });
+    }
+
+    fn handle_thread_context_compacted(
+        &mut self,
+        thread: Entity<Thread>,
+        _event: &ContextCompacted,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(thread.read(cx).id()) else {
+            return;
+        };
+        // After compaction, refresh the token usage since the context shrank
+        let usage = thread.read(cx).latest_token_usage();
+        session.acp_thread.update(cx, |acp_thread, cx| {
+            acp_thread.update_token_usage(usage, cx);
         });
     }
 

@@ -12,10 +12,10 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    DockPosition, DockSide, LanguageModelParameters, LanguageModelSelection, NewThreadLocation,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file,
+    ContextCompactConfig, DockPosition, DockSide, LanguageModelParameters,
+    LanguageModelSelection, NewThreadLocation, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone,
+    RegisterSetting, Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
+    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
 };
 
 pub use crate::agent_profile::*;
@@ -23,6 +23,7 @@ pub use crate::agent_profile::*;
 pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread_prompt.txt");
 pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
+pub const COMPACT_CONTEXT_PROMPT: &str = include_str!("prompts/compact_context_prompt.txt");
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelLayout {
@@ -167,6 +168,7 @@ pub struct AgentSettings {
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub new_thread_location: NewThreadLocation,
+    pub context_compact: ContextCompactConfig,
 }
 
 impl AgentSettings {
@@ -622,6 +624,10 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             new_thread_location: agent.new_thread_location.unwrap_or_default(),
+            context_compact: agent
+                .context_compact
+                .map(|c| c.config())
+                .unwrap_or_default(),
         }
     }
 }

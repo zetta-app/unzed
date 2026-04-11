@@ -1,11 +1,11 @@
 ---
 title: AI Agent Settings - Zed
-description: "Customize Zed's AI agent: default models, temperature, tool approval, auto-run commands, notifications, and panel options."
+description: "Customize Zed's AI agent: default models, temperature, context compaction, tool approval, auto-run commands, notifications, and panel options."
 ---
 
 # Agent Settings
 
-Settings for Zed's Agent Panel, including model selection, UI preferences, and tool permissions.
+Settings for Zed's Agent Panel, including model selection, context compaction, UI preferences, and tool permissions.
 
 ## Model Settings {#model-settings}
 
@@ -135,6 +135,95 @@ Specify a custom temperature for a provider and/or model:
   }
 }
 ```
+
+## Context Compaction {#context-compaction}
+
+As conversations grow, they consume more of the model's context window. When usage approaches the limit, Zed can automatically compact older messages to free up token budget so the conversation can continue in the same thread.
+
+### Enabling and Disabling
+
+Context compaction is enabled by default. Use a boolean shorthand to toggle it:
+
+```json [settings]
+{
+  "agent": {
+    "context_compact": true
+  }
+}
+```
+
+Set it to `false` to disable automatic compaction entirely. When disabled, Zed shows the original warning callout suggesting you start a new thread.
+
+### Compaction Methods {#compaction-methods}
+
+Three methods are available, each with different tradeoffs:
+
+| Method                         | Description                                                                                                  | LLM Cost | Fidelity |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------ | -------- | -------- |
+| `summarize`                    | An LLM rewrites older messages into a structured summary covering completed work, current state, and pending tasks. | Full LLM call | May paraphrase details |
+| `mask_tool_outputs`            | Replaces tool call outputs (file reads, grep results, terminal output) with short placeholders.              | None     | Exact tool names preserved, raw data lost |
+| `hybrid_mask_then_summarize`   | Masks tool outputs first, then summarizes the remaining conversation if still over the threshold.            | Reduced  | Best of both |
+
+The default method is `summarize`.
+
+```json [settings]
+{
+  "agent": {
+    "context_compact": {
+      "method": "summarize"
+    }
+  }
+}
+```
+
+### Full Configuration {#context-compact-config}
+
+For fine-grained control, pass an object with any combination of these options:
+
+```json [settings]
+{
+  "agent": {
+    "context_compact": {
+      "enabled": true,
+      "method": "summarize",
+      "threshold": 0.8,
+      "preserve_recent_messages": 1,
+      "model": {
+        "provider": "google",
+        "model": "gemini-2.0-flash"
+      },
+      "custom_prompt": "Always preserve file paths and line numbers verbatim"
+    }
+  }
+}
+```
+
+| Option                       | Type    | Default       | Description                                                                                          |
+| ---------------------------- | ------- | ------------- | ---------------------------------------------------------------------------------------------------- |
+| `enabled`                    | bool    | `true`        | Master on/off switch.                                                                                |
+| `method`                     | string  | `"summarize"` | Compaction strategy: `"summarize"`, `"mask_tool_outputs"`, or `"hybrid_mask_then_summarize"`.         |
+| `threshold`                  | float   | `0.8`         | Context usage ratio (0.0–1.0) at which compaction triggers. `0.8` means 80% of the token budget.     |
+| `preserve_recent_messages`   | integer | `1`           | Number of recent user–assistant exchanges to keep intact (never compacted).                           |
+| `model`                      | object  | —             | Model to use for summarization. Falls back to the thread summary model, then the default model.       |
+| `custom_prompt`              | string  | —             | Extra instructions appended to the compaction prompt (e.g., what to focus on or preserve).            |
+
+### How It Works
+
+When token usage crosses the configured threshold, Zed:
+
+1. Identifies older messages that can be compacted (everything before the most recent exchanges, controlled by `preserve_recent_messages`).
+2. Applies the chosen method to compress those messages.
+3. Injects the compacted context into future LLM requests so the model retains awareness of earlier work.
+4. Shows a green info callout confirming the compaction succeeded.
+
+Compacted context is persisted with the thread, so reloading a thread preserves the summary.
+
+### Tips
+
+- Use `"mask_tool_outputs"` for local models where you want zero extra LLM cost.
+- Use `"hybrid_mask_then_summarize"` for long sessions with many tool calls — it masks the bulky tool outputs first, then summarizes the remaining conversation for deeper compression.
+- Set `"preserve_recent_messages": 2` or higher if you find the model losing track of very recent context after compaction.
+- Use `"custom_prompt"` to steer the summarizer: `"Focus on code samples and API usage"` or `"Always preserve error messages verbatim"`.
 
 ## Agent Panel Settings {#agent-panel-settings}
 

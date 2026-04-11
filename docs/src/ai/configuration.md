@@ -12,7 +12,8 @@ You can configure multiple dimensions of AI usage in Zed:
    - [Using your own API keys](./llm-providers.md), which do not require the above
    - Using [external agents like Claude Agent](./external-agents.md), which also do not require the above
 2. [Model parameters and usage](./agent-settings.md#model-settings)
-3. [Interactions with the Agent Panel](./agent-settings.md#agent-panel-settings)
+3. [Context compaction](./agent-settings.md#context-compaction) — automatic context management for long conversations
+4. [Interactions with the Agent Panel](./agent-settings.md#agent-panel-settings)
 
 ## Turning AI Off Entirely
 

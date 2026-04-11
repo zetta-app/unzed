@@ -14,7 +14,8 @@ use feature_flags::{
 
 use agent_client_protocol as acp;
 use agent_settings::{
-    AgentProfileId, AgentSettings, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT,
+    AgentProfileId, AgentSettings, COMPACT_CONTEXT_PROMPT, SUMMARIZE_THREAD_DETAILED_PROMPT,
+    SUMMARIZE_THREAD_PROMPT,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -46,7 +47,10 @@ use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelSelection, Settings, ToolPermissionMode, update_settings_file};
+use settings::{
+    ContextCompactConfig, ContextCompactMethod, LanguageModelSelection, Settings,
+    ToolPermissionMode, update_settings_file,
+};
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -967,6 +971,10 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    /// Summary of compacted (removed) earlier messages, injected into requests as context.
+    context_compact_summary: Option<String>,
+    /// Task for an in-progress context compaction.
+    pending_compaction: Option<Task<()>>,
 }
 
 impl Thread {
@@ -1087,6 +1095,8 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            context_compact_summary: None,
+            pending_compaction: None,
         }
     }
 
@@ -1319,6 +1329,8 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            context_compact_summary: db_thread.context_compact_summary,
+            pending_compaction: None,
         }
     }
 
@@ -1349,6 +1361,7 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
+            context_compact_summary: self.context_compact_summary.clone(),
         };
 
         cx.background_spawn(async move {
@@ -1661,6 +1674,12 @@ impl Thread {
                 Message::Agent(_) | Message::Resume => {}
             }
         }
+
+        // If all messages were removed, the compaction summary is no longer useful
+        if self.messages.is_empty() {
+            self.context_compact_summary = None;
+        }
+
         self.clear_summary();
         cx.notify();
         Ok(())
@@ -2681,6 +2700,219 @@ impl Thread {
         self.pending_summary_generation = None;
     }
 
+    /// Returns the stored context compaction summary, if any.
+    pub fn context_compact_summary(&self) -> Option<&str> {
+        self.context_compact_summary.as_deref()
+    }
+
+    /// Returns whether a context compaction is currently in progress.
+    pub fn is_compacting(&self) -> bool {
+        self.pending_compaction.is_some()
+    }
+
+    /// Compact the conversation context by summarizing all messages before the
+    /// last user message exchange. The summary replaces those messages in future
+    /// LLM requests, freeing token budget while preserving important context.
+    ///
+    /// The compaction strategy is determined by the `context_compact` settings:
+    /// - `summarize`: LLM rewrites older messages into a structured summary
+    /// - `mask_tool_outputs`: replaces tool outputs with short placeholders
+    /// - `hybrid_mask_then_summarize`: masks first, then summarizes if needed
+    pub fn compact_context(&mut self, cx: &mut Context<Self>) {
+        if self.pending_compaction.is_some() {
+            return;
+        }
+
+        let config = AgentSettings::get_global(cx).context_compact.clone();
+        let method = config.method.unwrap_or_default();
+
+        match method {
+            ContextCompactMethod::MaskToolOutputs => {
+                self.compact_by_masking_tool_outputs(cx);
+            }
+            ContextCompactMethod::Summarize => {
+                self.compact_by_summarization(&config, cx);
+            }
+            ContextCompactMethod::HybridMaskThenSummarize => {
+                // First pass: mask tool outputs synchronously
+                self.compact_by_masking_tool_outputs(cx);
+                // Second pass: summarize if still needed
+                self.compact_by_summarization(&config, cx);
+            }
+        }
+    }
+
+    /// Replace tool call outputs in older messages with short placeholders.
+    /// This is a synchronous, zero-LLM-cost compaction method.
+    fn compact_by_masking_tool_outputs(&mut self, cx: &mut Context<Self>) {
+        let config = AgentSettings::get_global(cx).context_compact.clone();
+        let preserve_count = config.preserve_recent_messages.unwrap_or(1);
+        let boundary = self.compaction_boundary_with_preserve(preserve_count);
+        if boundary == 0 {
+            return;
+        }
+
+        let mut masked_any = false;
+        for message in &mut self.messages[..boundary] {
+            if let Message::Agent(agent_message) = message {
+                for tool_result in agent_message.tool_results.values_mut() {
+                    let placeholder: Arc<str> = format!(
+                        "[Tool result: {} (id: {})]",
+                        tool_result.tool_name, tool_result.tool_use_id
+                    )
+                    .into();
+                    if !matches!(&tool_result.content, LanguageModelToolResultContent::Text(t) if *t == placeholder)
+                    {
+                        tool_result.content =
+                            LanguageModelToolResultContent::Text(placeholder);
+                        tool_result.output = None;
+                        masked_any = true;
+                    }
+                }
+            }
+        }
+
+        if masked_any {
+            self.clear_summary();
+            cx.emit(ContextCompacted);
+            cx.notify();
+        }
+    }
+
+    /// Compact by having an LLM summarize older messages.
+    fn compact_by_summarization(
+        &mut self,
+        config: &ContextCompactConfig,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_compaction.is_some() {
+            return;
+        }
+
+        let model = self
+            .summarization_model
+            .clone()
+            .or_else(|| self.model.clone());
+        let Some(model) = model else {
+            log::error!("No model available for context compaction");
+            return;
+        };
+
+        let preserve_count = config.preserve_recent_messages.unwrap_or(1);
+        let compact_up_to = self.compaction_boundary_with_preserve(preserve_count);
+        if compact_up_to == 0 {
+            log::debug!("Nothing to compact");
+            return;
+        }
+
+        let mut request = LanguageModelRequest {
+            intent: Some(CompletionIntent::ContextCompaction),
+            temperature: AgentSettings::temperature_for_model(&model, cx),
+            ..Default::default()
+        };
+
+        // Include existing compaction summary if we're re-compacting
+        if let Some(existing_summary) = &self.context_compact_summary {
+            request.messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![format!(
+                    "<previous_context_summary>\n{}\n</previous_context_summary>",
+                    existing_summary
+                )
+                .into()],
+                cache: false,
+                reasoning_details: None,
+            });
+            request.messages.push(LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec!["Understood, I have the previous context summary.".into()],
+                cache: false,
+                reasoning_details: None,
+            });
+        }
+
+        for message in &self.messages[..compact_up_to] {
+            request.messages.extend(message.to_request());
+        }
+
+        // Build the compaction prompt, appending custom instructions if configured
+        let mut prompt = COMPACT_CONTEXT_PROMPT.to_string();
+        if let Some(custom) = &config.custom_prompt {
+            prompt.push_str("\n\nAdditional instructions from the user:\n");
+            prompt.push_str(custom);
+        }
+
+        request.messages.push(LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![prompt.into()],
+            cache: false,
+            reasoning_details: None,
+        });
+
+        self.pending_compaction = Some(cx.spawn(async move |this, cx| {
+            let generate = async {
+                let mut summary = String::new();
+                let mut stream = model.stream_completion(request, cx).await?;
+                while let Some(event) = stream.next().await {
+                    let event = event?;
+                    if let LanguageModelCompletionEvent::Text(text) = event {
+                        summary.push_str(&text);
+                    }
+                }
+                anyhow::Ok(summary)
+            };
+
+            match generate.await {
+                Ok(summary) => {
+                    this.update(cx, |this, cx| {
+                        let compacted_messages: Vec<Message> =
+                            this.messages.drain(..compact_up_to).collect();
+
+                        for message in &compacted_messages {
+                            if let Message::User(user_message) = message {
+                                this.request_token_usage.remove(&user_message.id);
+                            }
+                        }
+
+                        this.context_compact_summary = Some(summary);
+                        this.pending_compaction = None;
+                        this.clear_summary();
+                        cx.emit(ContextCompacted);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    log::error!("Context compaction failed: {:?}", error);
+                    this.update(cx, |this, cx| {
+                        this.pending_compaction = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+    }
+
+    /// Determine the message index up to which we should compact,
+    /// preserving the specified number of recent user-agent exchange pairs.
+    fn compaction_boundary_with_preserve(&self, preserve_count: usize) -> usize {
+        let mut user_message_indices = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if matches!(message, Message::User(_)) {
+                user_message_indices.push(index);
+            }
+        }
+
+        // Keep the last `preserve_count` user messages and everything after them
+        if user_message_indices.len() <= preserve_count {
+            return 0;
+        }
+
+        let keep_from = user_message_indices[user_message_indices.len() - preserve_count];
+        keep_from
+    }
+
     fn last_user_message(&self) -> Option<&UserMessage> {
         self.messages
             .iter()
@@ -2974,6 +3206,37 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
+
+        // If we have a compaction summary, inject it as context before the
+        // remaining messages so the model has the condensed history.
+        if let Some(summary) = &self.context_compact_summary {
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![format!(
+                    "<context_summary>\n\
+                     The following is a summary of the earlier part of this conversation \
+                     that has been compacted to save context space:\n\n\
+                     {}\n\
+                     </context_summary>\n\n\
+                     Continue the conversation using this context. \
+                     Do not ask the user to repeat information that is in the summary.",
+                    summary
+                )
+                .into()],
+                cache: false,
+                reasoning_details: None,
+            });
+            messages.push(LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec![
+                    "I have the context from our earlier conversation. I'll continue from where we left off."
+                        .into(),
+                ],
+                cache: false,
+                reasoning_details: None,
+            });
+        }
+
         for message in &self.messages {
             messages.extend(message.to_request());
         }
@@ -2991,6 +3254,13 @@ impl Thread {
 
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
+
+        if let Some(summary) = &self.context_compact_summary {
+            markdown.push_str("## Compacted Context\n\n");
+            markdown.push_str(summary);
+            markdown.push_str("\n\n---\n\n");
+        }
+
         for (ix, message) in self.messages.iter().enumerate() {
             if ix > 0 {
                 markdown.push('\n');
@@ -3155,6 +3425,10 @@ impl EventEmitter<TokenUsageUpdated> for Thread {}
 pub struct TitleUpdated;
 
 impl EventEmitter<TitleUpdated> for Thread {}
+
+pub struct ContextCompacted;
+
+impl EventEmitter<ContextCompacted> for Thread {}
 
 /// A channel-based wrapper that delivers tool input to a running tool.
 ///

@@ -81,6 +81,8 @@ pub struct DbThread {
     pub draft_prompt: Option<Vec<acp::ContentBlock>>,
     #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
+    #[serde(default)]
+    pub context_compact_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -130,6 +132,7 @@ impl SharedThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            context_compact_summary: None,
         }
     }
 
@@ -309,6 +312,7 @@ impl DbThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            context_compact_summary: None,
         })
     }
 }
@@ -694,6 +698,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            context_compact_summary: None,
         }
     }
 

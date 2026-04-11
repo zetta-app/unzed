@@ -352,6 +352,7 @@ impl LanguageModel for CopilotChatLanguageModel {
         let is_user_initiated = request.intent.is_none_or(|intent| match intent {
             CompletionIntent::UserPrompt
             | CompletionIntent::ThreadContextSummarization
+            | CompletionIntent::ContextCompaction
             | CompletionIntent::InlineAssist
             | CompletionIntent::TerminalInlineAssist
             | CompletionIntent::GenerateGitCommitMessage => true,
@@ -1076,6 +1077,7 @@ fn intent_to_chat_location(intent: Option<CompletionIntent>) -> ChatLocation {
         Some(CompletionIntent::ToolResults) => ChatLocation::Agent,
         Some(CompletionIntent::ThreadSummarization) => ChatLocation::Panel,
         Some(CompletionIntent::ThreadContextSummarization) => ChatLocation::Panel,
+        Some(CompletionIntent::ContextCompaction) => ChatLocation::Panel,
         Some(CompletionIntent::CreateFile) => ChatLocation::Agent,
         Some(CompletionIntent::EditFile) => ChatLocation::Agent,
         Some(CompletionIntent::InlineAssist) => ChatLocation::Editor,

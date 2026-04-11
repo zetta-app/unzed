@@ -1160,6 +1160,22 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Whether to automatically compact the conversation context when the
+    // token limit is approaching. When enabled, older messages are summarized
+    // and replaced to free up token budget, allowing the conversation to
+    // continue in the same thread.
+    //
+    // Can be set to `true`/`false` as shorthand, or an object for fine-grained control:
+    //   "context_compact": {
+    //     "enabled": true,
+    //     "method": "summarize",       // "summarize", "mask_tool_outputs", or "hybrid_mask_then_summarize"
+    //     "threshold": 0.8,            // context usage ratio (0.0-1.0) to trigger compaction
+    //     "preserve_recent_messages": 1, // number of recent exchanges to keep intact
+    //     "custom_prompt": "Focus on code samples and file paths"
+    //   }
+    //
+    // Default: true
+    "context_compact": true
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

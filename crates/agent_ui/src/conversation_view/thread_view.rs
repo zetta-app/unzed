@@ -8405,18 +8405,94 @@ impl ThreadView {
         let token_usage = self.thread.read(cx).token_usage()?;
         let ratio = token_usage.ratio();
 
+        let compact_config = &AgentSettings::get_global(cx).context_compact;
+        let compact_enabled = compact_config.enabled.unwrap_or(true);
+        let native_thread = self.as_native_thread(cx);
+        let is_compacting = native_thread
+            .as_ref()
+            .is_some_and(|t| t.read(cx).is_compacting());
+        let has_compact_summary = native_thread
+            .as_ref()
+            .is_some_and(|t| t.read(cx).context_compact_summary().is_some());
+
+        // If compaction just completed, show a success callout
+        if has_compact_summary && matches!(ratio, acp_thread::TokenUsageRatio::Normal) {
+            return Some(
+                Callout::new()
+                    .severity(Severity::Success)
+                    .icon(IconName::Check)
+                    .title("Context compacted")
+                    .description(
+                        "Older messages were summarized to free up token space. \
+                         The conversation continues with full context.",
+                    )
+                    .dismiss_action(self.dismiss_error_button(cx)),
+            );
+        }
+
+        // If compaction is in progress, show an info callout
+        if is_compacting {
+            return Some(
+                Callout::new()
+                    .severity(Severity::Info)
+                    .icon(IconName::ArrowCircle)
+                    .title("Compacting context")
+                    .description(
+                        "Summarizing older messages to free up token space...",
+                    ),
+            );
+        }
+
         let (severity, icon, title) = match ratio {
             acp_thread::TokenUsageRatio::Normal => return None,
-            acp_thread::TokenUsageRatio::Warning => (
-                Severity::Warning,
-                IconName::Warning,
-                "Thread reaching the token limit soon",
-            ),
-            acp_thread::TokenUsageRatio::Exceeded => (
-                Severity::Error,
-                IconName::XCircle,
-                "Thread reached the token limit",
-            ),
+            acp_thread::TokenUsageRatio::Warning => {
+                if compact_enabled {
+                    if let Some(thread) = &native_thread {
+                        thread.update(cx, |thread, cx| {
+                            thread.compact_context(cx);
+                        });
+                        return Some(
+                            Callout::new()
+                                .severity(Severity::Info)
+                                .icon(IconName::ArrowCircle)
+                                .title("Compacting context")
+                                .description(
+                                    "Summarizing older messages to free up token space...",
+                                ),
+                        );
+                    }
+                }
+                (
+                    Severity::Warning,
+                    IconName::Warning,
+                    "Thread reaching the token limit soon",
+                )
+            }
+            acp_thread::TokenUsageRatio::Exceeded => {
+                if compact_enabled {
+                    if let Some(thread) = &native_thread {
+                        if !thread.read(cx).is_compacting() {
+                            thread.update(cx, |thread, cx| {
+                                thread.compact_context(cx);
+                            });
+                            return Some(
+                                Callout::new()
+                                    .severity(Severity::Info)
+                                    .icon(IconName::ArrowCircle)
+                                    .title("Compacting context")
+                                    .description(
+                                        "Summarizing older messages to free up token space...",
+                                    ),
+                            );
+                        }
+                    }
+                }
+                (
+                    Severity::Error,
+                    IconName::XCircle,
+                    "Thread reached the token limit",
+                )
+            }
         };
 
         let description = "To continue, start a new thread from a summary.";
