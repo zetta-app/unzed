@@ -518,12 +518,14 @@ pub fn into_qwen(
 
 pub struct QwenEventMapper {
     tool_calls_by_index: HashMap<usize, RawToolCall>,
+    sent_start_message: bool,
 }
 
 impl QwenEventMapper {
     pub fn new() -> Self {
         Self {
             tool_calls_by_index: HashMap::default(),
+            sent_start_message: false,
         }
     }
 
@@ -563,6 +565,14 @@ impl QwenEventMapper {
         let choice = &event.choices[0];
 
         let mut events = Vec::new();
+
+        if !self.sent_start_message {
+            self.sent_start_message = true;
+            events.push(Ok(LanguageModelCompletionEvent::StartMessage {
+                message_id: event.id.clone(),
+            }));
+        }
+
         if let Some(content) = choice.delta.content.clone()
             && !content.is_empty()
         {
