@@ -8288,6 +8288,179 @@ impl ThreadView {
             .into_any_element()
     }
 
+    fn render_rules_banner(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let thread = self.as_native_thread(cx)?;
+        let project_context = thread.read(cx).project_context().read(cx);
+
+        // Collect info about all worktrees that have available rules files.
+        let worktrees_with_rules: Vec<_> = project_context
+            .worktrees
+            .iter()
+            .filter(|wt| !wt.available_rules_files.is_empty())
+            .collect();
+
+        if worktrees_with_rules.is_empty() {
+            return None;
+        }
+
+        let mut children = Vec::new();
+        for worktree in &worktrees_with_rules {
+            let selected_name: SharedString = worktree
+                .rules_file
+                .as_ref()
+                .map(|rf| {
+                    SharedString::from(format!(
+                        "{}/{}",
+                        worktree.root_name,
+                        rf.path_in_worktree.as_unix_str()
+                    ))
+                })
+                .unwrap_or_else(|| "None".into());
+
+            let available_count = worktree.available_rules_files.len();
+            let root_name = worktree.root_name.clone();
+
+            // If there's only one rules file, just show it as a label.
+            if available_count == 1 {
+                children.push(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::Reader)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("Using rules: {}", selected_name))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+            } else {
+                // Multiple rules files available — show a dropdown.
+                let items: Vec<(usize, SharedString, bool)> = worktree
+                    .available_rules_files
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, rf)| {
+                        let label = SharedString::from(format!(
+                            "{}/{}",
+                            root_name, rf.path_in_worktree.as_unix_str()
+                        ));
+                        let is_selected = worktree.selected_rules_index == Some(idx);
+                        (idx, label, is_selected)
+                    })
+                    .collect();
+
+                let root_name_for_menu = root_name.clone();
+                let thread_entity = thread.clone();
+
+                children.push(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::Reader)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("Rules:")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            PopoverMenu::new(format!("rules-picker-{}", root_name))
+                                .trigger(
+                                    Button::new(
+                                        format!("rules-trigger-{}", root_name),
+                                        selected_name,
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                                .menu(move |window, cx| {
+                                    let items = items.clone();
+                                    let root_name = root_name_for_menu.clone();
+                                    let thread_entity = thread_entity.clone();
+
+                                    Some(ContextMenu::build(
+                                        window,
+                                        cx,
+                                        move |mut menu, _, _| {
+                                            for (idx, label, is_selected) in items.iter() {
+                                                let root_name = root_name.clone();
+                                                let thread_entity = thread_entity.clone();
+                                                let idx = *idx;
+                                                menu = menu.toggleable_entry(
+                                                    label.clone(),
+                                                    *is_selected,
+                                                    IconPosition::End,
+                                                    None,
+                                                    move |_window, cx| {
+                                                        let root_name = root_name.clone();
+                                                        thread_entity
+                                                            .update(cx, |thread, cx| {
+                                                                let path = thread
+                                                                    .project_context()
+                                                                    .read(cx)
+                                                                    .worktrees
+                                                                    .iter()
+                                                                    .find(|wt| {
+                                                                        wt.root_name == root_name
+                                                                    })
+                                                                    .and_then(|wt| {
+                                                                        wt.available_rules_files
+                                                                            .get(idx)
+                                                                    })
+                                                                    .map(|rf| {
+                                                                        rf.path_in_worktree.clone()
+                                                                    });
+                                                                if let Some(path) = path {
+                                                                    thread
+                                                                        .project_context()
+                                                                        .update(
+                                                                            cx,
+                                                                            |ctx, _cx| {
+                                                                                ctx.select_rules_file(
+                                                                                    &root_name,
+                                                                                    &path,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                    cx.notify();
+                                                                }
+                                                            });
+                                                    },
+                                                );
+                                            }
+                                            menu
+                                        },
+                                    ))
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        Some(
+            v_flex()
+                .px_4()
+                .py_1p5()
+                .gap_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().element_background)
+                .children(children)
+                .into_any_element(),
+        )
+    }
+
     fn update_recent_history_from_cache(
         &mut self,
         history: &Entity<ThreadHistory>,
@@ -8641,6 +8814,7 @@ impl Render for ThreadView {
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
+            .children(self.render_rules_banner(cx))
             .map(|this| {
                 if has_messages {
                     this.flex_1()

@@ -1525,6 +1525,8 @@ impl EditAgentTest {
                 root_name: "root".to_string(),
                 abs_path: Path::new("/path/to/root").into(),
                 rules_file: None,
+                available_rules_files: Vec::new(),
+                selected_rules_index: None,
             }];
             let project_context = ProjectContext::new(worktrees, Vec::default());
             let tool_names = tools

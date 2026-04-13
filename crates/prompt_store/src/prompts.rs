@@ -61,6 +61,54 @@ impl ProjectContext {
                 .to_string(),
         }
     }
+
+    /// Select a different project rules file for the given worktree by path.
+    /// Returns true if the selection changed.
+    pub fn select_rules_file(&mut self, worktree_root: &str, path: &RelPath) -> bool {
+        for worktree in &mut self.worktrees {
+            if worktree.root_name != worktree_root {
+                continue;
+            }
+            let index = worktree
+                .available_rules_files
+                .iter()
+                .position(|rf| rf.path_in_worktree.as_ref() == path);
+            if let Some(index) = index {
+                if worktree.selected_rules_index == Some(index) {
+                    return false;
+                }
+                worktree.selected_rules_index = Some(index);
+                worktree.rules_file = Some(worktree.available_rules_files[index].clone());
+                self.has_rules = self
+                    .worktrees
+                    .iter()
+                    .any(|wt| wt.rules_file.is_some());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Deselect project rules for the given worktree (use no rules file).
+    /// Returns true if the selection changed.
+    pub fn deselect_rules_file(&mut self, worktree_root: &str) -> bool {
+        for worktree in &mut self.worktrees {
+            if worktree.root_name != worktree_root {
+                continue;
+            }
+            if worktree.selected_rules_index.is_none() {
+                return false;
+            }
+            worktree.selected_rules_index = None;
+            worktree.rules_file = None;
+            self.has_rules = self
+                .worktrees
+                .iter()
+                .any(|wt| wt.rules_file.is_some());
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,7 +122,14 @@ pub struct UserRulesContext {
 pub struct WorktreeContext {
     pub root_name: String,
     pub abs_path: Arc<Path>,
+    /// The currently selected rules file (used in the system prompt template).
     pub rules_file: Option<RulesFileContext>,
+    /// All rules files found in this worktree.
+    #[serde(skip)]
+    pub available_rules_files: Vec<RulesFileContext>,
+    /// Index into `available_rules_files` for the selected file, if any.
+    #[serde(skip)]
+    pub selected_rules_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]

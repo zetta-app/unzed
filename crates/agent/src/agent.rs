@@ -498,6 +498,39 @@ impl NativeAgent {
                     state
                         .project_context
                         .update(cx, |current_project_context, _cx| {
+                            // Preserve the user's rules file selection when refreshing.
+                            for new_wt in &mut project_context.worktrees.clone() {
+                                if let Some(old_wt) = current_project_context
+                                    .worktrees
+                                    .iter()
+                                    .find(|wt| wt.root_name == new_wt.root_name)
+                                {
+                                    if let Some(old_idx) = old_wt.selected_rules_index {
+                                        if let Some(old_selected) =
+                                            old_wt.available_rules_files.get(old_idx)
+                                        {
+                                            // Try to find the same file in the new available list.
+                                            if let Some(new_idx) =
+                                                new_wt.available_rules_files.iter().position(|rf| {
+                                                    rf.path_in_worktree
+                                                        == old_selected.path_in_worktree
+                                                })
+                                            {
+                                                new_wt.selected_rules_index = Some(new_idx);
+                                                new_wt.rules_file = Some(
+                                                    new_wt.available_rules_files[new_idx].clone(),
+                                                );
+                                            }
+                                        }
+                                    } else if old_wt.selected_rules_index.is_none()
+                                        && !old_wt.available_rules_files.is_empty()
+                                    {
+                                        // User explicitly deselected rules — preserve that.
+                                        new_wt.selected_rules_index = None;
+                                        new_wt.rules_file = None;
+                                    }
+                                }
+                            }
                             *current_project_context = project_context;
                         });
                 }
@@ -585,72 +618,86 @@ impl NativeAgent {
             root_name,
             abs_path,
             rules_file: None,
+            available_rules_files: Vec::new(),
+            selected_rules_index: None,
         };
 
-        let rules_task = Self::load_worktree_rules_file(worktree, project, cx);
-        let Some(rules_task) = rules_task else {
+        let rules_tasks = Self::load_worktree_rules_files(worktree, project, cx);
+        if rules_tasks.is_empty() {
             return Task::ready((context, None));
-        };
+        }
 
         cx.spawn(async move |_| {
-            let (rules_file, rules_file_error) = match rules_task.await {
-                Ok(rules_file) => (Some(rules_file), None),
-                Err(err) => (
-                    None,
-                    Some(RulesLoadingError {
-                        message: format!("{err}").into(),
-                    }),
-                ),
-            };
-            context.rules_file = rules_file;
-            (context, rules_file_error)
+            let mut available = Vec::new();
+            let mut first_error = None;
+            for task in rules_tasks {
+                match task.await {
+                    Ok(rules_file) => available.push(rules_file),
+                    Err(err) if first_error.is_none() => {
+                        first_error = Some(RulesLoadingError {
+                            message: format!("{err}").into(),
+                        });
+                    }
+                    Err(_) => {}
+                }
+            }
+            if !available.is_empty() {
+                context.rules_file = Some(available[0].clone());
+                context.selected_rules_index = Some(0);
+            }
+            context.available_rules_files = available;
+            (context, first_error)
         })
     }
 
-    fn load_worktree_rules_file(
+    fn load_worktree_rules_files(
         worktree: Entity<Worktree>,
         project: Entity<Project>,
         cx: &mut App,
-    ) -> Option<Task<Result<RulesFileContext>>> {
-        let worktree = worktree.read(cx);
-        let worktree_id = worktree.id();
-        let selected_rules_file = RULES_FILE_NAMES
-            .into_iter()
+    ) -> Vec<Task<Result<RulesFileContext>>> {
+        let worktree_read = worktree.read(cx);
+        let worktree_id = worktree_read.id();
+
+        let matching_paths: Vec<_> = RULES_FILE_NAMES
+            .iter()
             .filter_map(|name| {
-                worktree
+                worktree_read
                     .entry_for_path(RelPath::unix(name).unwrap())
                     .filter(|entry| entry.is_file())
                     .map(|entry| entry.path.clone())
             })
-            .next();
+            .collect();
 
         // Note that Cline supports `.clinerules` being a directory, but that is not currently
         // supported. This doesn't seem to occur often in GitHub repositories.
-        selected_rules_file.map(|path_in_worktree| {
-            let project_path = ProjectPath {
-                worktree_id,
-                path: path_in_worktree.clone(),
-            };
-            let buffer_task =
-                project.update(cx, |project, cx| project.open_buffer(project_path, cx));
-            let rope_task = cx.spawn(async move |cx| {
-                let buffer = buffer_task.await?;
-                let (project_entry_id, rope) = buffer.read_with(cx, |buffer, cx| {
-                    let project_entry_id = buffer.entry_id(cx).context("buffer has no file")?;
-                    anyhow::Ok((project_entry_id, buffer.as_rope().clone()))
-                })?;
-                anyhow::Ok((project_entry_id, rope))
-            });
-            // Build a string from the rope on a background thread.
-            cx.background_spawn(async move {
-                let (project_entry_id, rope) = rope_task.await?;
-                anyhow::Ok(RulesFileContext {
-                    path_in_worktree,
-                    text: rope.to_string().trim().to_string(),
-                    project_entry_id: project_entry_id.to_usize(),
+        matching_paths
+            .into_iter()
+            .map(|path_in_worktree| {
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: path_in_worktree.clone(),
+                };
+                let buffer_task =
+                    project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+                let rope_task = cx.spawn(async move |cx| {
+                    let buffer = buffer_task.await?;
+                    let (project_entry_id, rope) = buffer.read_with(cx, |buffer, cx| {
+                        let project_entry_id =
+                            buffer.entry_id(cx).context("buffer has no file")?;
+                        anyhow::Ok((project_entry_id, buffer.as_rope().clone()))
+                    })?;
+                    anyhow::Ok((project_entry_id, rope))
+                });
+                cx.background_spawn(async move {
+                    let (project_entry_id, rope) = rope_task.await?;
+                    anyhow::Ok(RulesFileContext {
+                        path_in_worktree,
+                        text: rope.to_string().trim().to_string(),
+                        project_entry_id: project_entry_id.to_usize(),
+                    })
                 })
             })
-        })
+            .collect()
     }
 
     fn handle_thread_title_updated(
@@ -2199,6 +2246,8 @@ mod internal_tests {
                 root_name: "a".into(),
                 abs_path: Path::new("/a").into(),
                 rules_file: None,
+                available_rules_files: Vec::new(),
+                selected_rules_index: None,
             }];
             assert_eq!(state.project_context.read(cx).worktrees, expected_worktrees);
             assert_eq!(
@@ -2217,14 +2266,17 @@ mod internal_tests {
                 .read(cx)
                 .entry_for_path(rel_path(".rules"))
                 .unwrap();
+            let rules_file = RulesFileContext {
+                path_in_worktree: rel_path(".rules").into(),
+                text: "".into(),
+                project_entry_id: rules_entry.id.to_usize(),
+            };
             let expected_worktrees = vec![WorktreeContext {
                 root_name: "a".into(),
                 abs_path: Path::new("/a").into(),
-                rules_file: Some(RulesFileContext {
-                    path_in_worktree: rel_path(".rules").into(),
-                    text: "".into(),
-                    project_entry_id: rules_entry.id.to_usize(),
-                }),
+                rules_file: Some(rules_file.clone()),
+                available_rules_files: vec![rules_file],
+                selected_rules_index: Some(0),
             }];
             assert_eq!(state.project_context.read(cx).worktrees, expected_worktrees);
             assert_eq!(
