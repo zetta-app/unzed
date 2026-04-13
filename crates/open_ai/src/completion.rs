@@ -470,6 +470,11 @@ impl OpenAiEventMapper {
             Some("stop") => {
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
+            Some("length") => {
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
+            }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
                     match parse_tool_arguments(&tool_call.arguments) {
@@ -1689,5 +1694,30 @@ mod tests {
                 .any(|e| matches!(e, LanguageModelCompletionEvent::Thinking { .. })),
             "OutputItemDone reasoning should not produce Thinking events"
         );
+    }
+
+    #[test]
+    fn chat_completions_stream_maps_length_finish_reason_to_max_tokens() {
+        let event = crate::ResponseStreamEvent {
+            choices: vec![crate::ChoiceDelta {
+                index: 0,
+                delta: Some(crate::ResponseMessageDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                }),
+                finish_reason: Some("length".into()),
+            }],
+            usage: None,
+        };
+
+        let mut mapper = OpenAiEventMapper::new();
+        let events = mapper.map_event(event);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].as_ref().unwrap(),
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens)
+        ));
     }
 }
