@@ -748,10 +748,22 @@ impl NativeAgent {
         let Some(session) = self.sessions.get(thread.read(cx).id()) else {
             return;
         };
-        // After compaction, refresh the token usage since the context shrank
+
+        let should_push_summary = thread.update(cx, |thread, _cx| {
+            thread.take_new_compaction_summary()
+        });
+        let summary = if should_push_summary {
+            thread.read(cx).context_compact_summary().map(|s| s.to_string())
+        } else {
+            None
+        };
+
         let usage = thread.read(cx).latest_token_usage();
         session.acp_thread.update(cx, |acp_thread, cx| {
             acp_thread.update_token_usage(usage, cx);
+            if let Some(summary) = &summary {
+                acp_thread.push_compaction_summary(summary, cx);
+            }
         });
     }
 

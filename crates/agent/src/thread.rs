@@ -975,6 +975,17 @@ pub struct Thread {
     context_compact_summary: Option<String>,
     /// Task for an in-progress context compaction.
     pending_compaction: Option<Task<()>>,
+    /// Number of messages before the last compaction, for displaying reduction info.
+    pre_compaction_message_count: Option<usize>,
+    /// When a summarization compaction is in progress, the number of messages
+    /// from the front of `self.messages` that are being summarized. These
+    /// messages are excluded from `build_request_messages` so that new prompts
+    /// sent during compaction don't include the soon-to-be-removed history.
+    compacting_message_count: usize,
+    /// Set to `true` when a summarization compaction just completed and the
+    /// summary should be shown as a visible message in the UI thread.
+    /// Consumed (reset to `false`) by the event handler.
+    has_new_compaction_summary: bool,
 }
 
 impl Thread {
@@ -1097,6 +1108,9 @@ impl Thread {
             running_subagents: Vec::new(),
             context_compact_summary: None,
             pending_compaction: None,
+            pre_compaction_message_count: None,
+            compacting_message_count: 0,
+            has_new_compaction_summary: false,
         }
     }
 
@@ -1331,6 +1345,9 @@ impl Thread {
             running_subagents: Vec::new(),
             context_compact_summary: db_thread.context_compact_summary,
             pending_compaction: None,
+            pre_compaction_message_count: None,
+            compacting_message_count: 0,
+            has_new_compaction_summary: false,
         }
     }
 
@@ -2705,9 +2722,40 @@ impl Thread {
         self.context_compact_summary.as_deref()
     }
 
+    /// Replaces the stored context compaction summary with the given text.
+    /// Passing `None` clears the summary entirely.
+    pub fn set_context_compact_summary(
+        &mut self,
+        summary: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_compact_summary = summary;
+        self.clear_summary();
+        cx.emit(ContextCompacted);
+        cx.notify();
+    }
+
     /// Returns whether a context compaction is currently in progress.
     pub fn is_compacting(&self) -> bool {
         self.pending_compaction.is_some()
+    }
+
+    /// Returns the number of messages before the last compaction, if available.
+    /// Together with the current message count, this lets the UI show how much
+    /// the context was reduced.
+    pub fn pre_compaction_message_count(&self) -> Option<usize> {
+        self.pre_compaction_message_count
+    }
+
+    /// Returns the number of messages currently in the thread.
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Returns `true` if a compaction summary was just produced and should be
+    /// displayed in the UI. Calling this consumes the flag.
+    pub fn take_new_compaction_summary(&mut self) -> bool {
+        std::mem::replace(&mut self.has_new_compaction_summary, false)
     }
 
     /// Compact the conversation context by summarizing all messages before the
@@ -2719,36 +2767,66 @@ impl Thread {
     /// - `mask_tool_outputs`: replaces tool outputs with short placeholders
     /// - `hybrid_mask_then_summarize`: masks first, then summarizes if needed
     pub fn compact_context(&mut self, cx: &mut Context<Self>) {
+        self.compact_context_inner(false, cx);
+    }
+
+    /// Manually triggered compaction that ignores the preserve_recent_messages
+    /// constraint. Will compact all messages except the very last one.
+    pub fn compact_context_forced(&mut self, cx: &mut Context<Self>) {
+        self.compact_context_inner(true, cx);
+    }
+
+    fn compact_context_inner(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.pending_compaction.is_some() {
+            log::info!("compact_context: already compacting, skipping");
             return;
         }
+
+        self.pre_compaction_message_count = Some(self.messages.len());
 
         let config = AgentSettings::get_global(cx).context_compact.clone();
         let method = config.method.unwrap_or_default();
 
+        log::info!(
+            "compact_context: method={:?}, messages={}, preserve_recent={}, force={}",
+            method,
+            self.messages.len(),
+            config.preserve_recent_messages.unwrap_or(1),
+            force
+        );
+
         match method {
             ContextCompactMethod::MaskToolOutputs => {
-                self.compact_by_masking_tool_outputs(cx);
+                self.compact_by_masking_tool_outputs(force, cx);
             }
             ContextCompactMethod::Summarize => {
-                self.compact_by_summarization(&config, cx);
+                self.compact_by_summarization(&config, force, cx);
             }
             ContextCompactMethod::HybridMaskThenSummarize => {
-                // First pass: mask tool outputs synchronously
-                self.compact_by_masking_tool_outputs(cx);
-                // Second pass: summarize if still needed
-                self.compact_by_summarization(&config, cx);
+                self.compact_by_masking_tool_outputs(force, cx);
+                self.compact_by_summarization(&config, force, cx);
             }
         }
     }
 
     /// Replace tool call outputs in older messages with short placeholders.
     /// This is a synchronous, zero-LLM-cost compaction method.
-    fn compact_by_masking_tool_outputs(&mut self, cx: &mut Context<Self>) {
+    fn compact_by_masking_tool_outputs(&mut self, force: bool, cx: &mut Context<Self>) {
         let config = AgentSettings::get_global(cx).context_compact.clone();
         let preserve_count = config.preserve_recent_messages.unwrap_or(1);
-        let boundary = self.compaction_boundary_with_preserve(preserve_count);
+        let boundary = if force {
+            self.forced_compaction_boundary()
+        } else {
+            self.compaction_boundary_with_preserve(preserve_count)
+        };
+        log::info!(
+            "compact_by_masking_tool_outputs: boundary={}, messages={}, force={}",
+            boundary,
+            self.messages.len(),
+            force
+        );
         if boundary == 0 {
+            log::info!("compact_by_masking_tool_outputs: nothing to mask (boundary=0)");
             return;
         }
 
@@ -2783,6 +2861,7 @@ impl Thread {
     fn compact_by_summarization(
         &mut self,
         config: &ContextCompactConfig,
+        force: bool,
         cx: &mut Context<Self>,
     ) {
         if self.pending_compaction.is_some() {
@@ -2799,9 +2878,19 @@ impl Thread {
         };
 
         let preserve_count = config.preserve_recent_messages.unwrap_or(1);
-        let compact_up_to = self.compaction_boundary_with_preserve(preserve_count);
+        let compact_up_to = if force {
+            self.forced_compaction_boundary()
+        } else {
+            self.compaction_boundary_with_preserve(preserve_count)
+        };
+        log::info!(
+            "compact_by_summarization: compact_up_to={}, messages={}, force={}",
+            compact_up_to,
+            self.messages.len(),
+            force
+        );
         if compact_up_to == 0 {
-            log::debug!("Nothing to compact");
+            log::info!("compact_by_summarization: nothing to compact (boundary=0)");
             return;
         }
 
@@ -2849,6 +2938,8 @@ impl Thread {
             reasoning_details: None,
         });
 
+        self.compacting_message_count = compact_up_to;
+
         self.pending_compaction = Some(cx.spawn(async move |this, cx| {
             let generate = async {
                 let mut summary = String::new();
@@ -2876,6 +2967,8 @@ impl Thread {
 
                         this.context_compact_summary = Some(summary);
                         this.pending_compaction = None;
+                        this.compacting_message_count = 0;
+                        this.has_new_compaction_summary = true;
                         this.clear_summary();
                         cx.emit(ContextCompacted);
                         cx.notify();
@@ -2886,6 +2979,7 @@ impl Thread {
                     log::error!("Context compaction failed: {:?}", error);
                     this.update(cx, |this, cx| {
                         this.pending_compaction = None;
+                        this.compacting_message_count = 0;
                         cx.notify();
                     })
                     .ok();
@@ -2911,6 +3005,31 @@ impl Thread {
 
         let keep_from = user_message_indices[user_message_indices.len() - preserve_count];
         keep_from
+    }
+
+    /// For forced (manual) compaction: compact everything except the last
+    /// user message and everything after it. If there's only one user message,
+    /// compact everything before it (the agent messages that precede it).
+    /// If there are no user messages, compact all but the last message.
+    fn forced_compaction_boundary(&self) -> usize {
+        if self.messages.len() <= 1 {
+            return 0;
+        }
+
+        // Find the last user message index
+        let last_user_idx = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| matches!(m, Message::User(_)).then_some(i));
+
+        match last_user_idx {
+            Some(idx) if idx > 0 => idx,
+            // Only one user message at index 0, or no user messages:
+            // compact all but the last message
+            _ => self.messages.len().saturating_sub(1),
+        }
     }
 
     fn last_user_message(&self) -> Option<&UserMessage> {
@@ -3237,7 +3356,10 @@ impl Thread {
             });
         }
 
-        for message in &self.messages {
+        // Skip messages that are currently being compacted (summarized).
+        // They will be drained once the summarization completes.
+        let skip = self.compacting_message_count;
+        for message in &self.messages[skip..] {
             messages.extend(message.to_request());
         }
 
