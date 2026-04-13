@@ -129,6 +129,14 @@ impl Model {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    None,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     pub model: String,
     pub messages: Vec<RequestMessage>,
@@ -141,6 +149,8 @@ pub struct Request {
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

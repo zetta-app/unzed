@@ -499,6 +499,11 @@ pub fn into_qwen(
                 },
             })
             .collect(),
+        tool_choice: request.tool_choice.map(|choice| match choice {
+            LanguageModelToolChoice::Auto => qwen::ToolChoice::Auto,
+            LanguageModelToolChoice::Any => qwen::ToolChoice::Required,
+            LanguageModelToolChoice::None => qwen::ToolChoice::None,
+        }),
         parallel_tool_calls,
         stream_options: Some(qwen::StreamOptions {
             include_usage: true,
