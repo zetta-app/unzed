@@ -10,11 +10,17 @@ use std::sync::{Arc, LazyLock};
 /// When an extension with this ID is installed, the built-in provider should be hidden.
 static BUILTIN_TO_EXTENSION_MAP: LazyLock<HashMap<&'static str, &'static str>> =
     LazyLock::new(|| {
+        #[allow(unused_mut)]
         let mut map = HashMap::default();
+        #[cfg(feature = "anthropic")]
         map.insert("anthropic", "anthropic");
+        #[cfg(feature = "open_ai")]
         map.insert("openai", "openai");
+        #[cfg(feature = "google")]
         map.insert("google", "google-ai");
+        #[cfg(feature = "open_router")]
         map.insert("openrouter", "openrouter");
+        #[cfg(feature = "copilot_chat")]
         map.insert("copilot_chat", "copilot-chat");
         map
     });

@@ -1,4 +1,4 @@
-use language_models::provider::anthropic::telemetry::{
+use language_models::provider::anthropic_telemetry::{
     AnthropicCompletionType, AnthropicEventData, AnthropicEventType, report_anthropic_event,
 };
 use std::mem;

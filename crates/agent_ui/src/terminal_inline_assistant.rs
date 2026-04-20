@@ -19,7 +19,7 @@ use language_model::{
     CompletionIntent, ConfiguredModel, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
 };
-use language_models::provider::anthropic::telemetry::{
+use language_models::provider::anthropic_telemetry::{
     AnthropicCompletionType, AnthropicEventData, AnthropicEventType, report_anthropic_event,
 };
 use project::Project;

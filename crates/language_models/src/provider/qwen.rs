@@ -489,6 +489,15 @@ pub fn into_qwen(
 
     let parallel_tool_calls = settings_model.map(|m| m.capabilities.parallel_tool_calls);
 
+    log::info!(
+        "into_qwen: max_output_tokens={:?}, max_completion_tokens={:?}, \
+         settings_max_output={:?}, settings_max_completion={:?}",
+        max_output_tokens,
+        max_completion_tokens,
+        settings_model.and_then(|m| m.max_output_tokens),
+        settings_model.and_then(|m| m.max_completion_tokens),
+    );
+
     let qwen_request = qwen::Request {
         model: model.id().to_string(),
         messages,
@@ -527,6 +536,13 @@ pub fn into_qwen(
             None
         },
     };
+
+    if let Ok(json) = serde_json::to_string_pretty(&qwen_request) {
+        log::info!("Qwen request: {} bytes, writing to qwen_request.json", json.len());
+        std::fs::write("qwen_request.json", &json).ok();
+    } else {
+        log::error!("Qwen request: failed to serialize request to JSON");
+    }
 
     log::info!(
         "Qwen request: model={}, messages={}, tools={}, enable_thinking={:?}, \
@@ -587,6 +603,7 @@ pub fn into_qwen(
 pub struct QwenEventMapper {
     tool_calls_by_index: HashMap<usize, RawToolCall>,
     sent_start_message: bool,
+    accumulated_content: String,
 }
 
 impl QwenEventMapper {
@@ -594,6 +611,7 @@ impl QwenEventMapper {
         Self {
             tool_calls_by_index: HashMap::default(),
             sent_start_message: false,
+            accumulated_content: String::new(),
         }
     }
 
@@ -702,6 +720,7 @@ impl QwenEventMapper {
             if let Some(content) = delta.content.clone()
                 && !content.is_empty()
             {
+                self.accumulated_content.push_str(&content);
                 events.push(Ok(LanguageModelCompletionEvent::Text(content)));
             }
 
@@ -764,8 +783,58 @@ impl QwenEventMapper {
 
         match choice.finish_reason.as_deref() {
             Some("stop") => {
+                if !self.accumulated_content.is_empty() {
+                    let preview: String = self.accumulated_content.chars().take(200).collect();
+                    log::info!(
+                        "Qwen full content at stop ({} chars): {}{}",
+                        self.accumulated_content.len(),
+                        preview,
+                        if self.accumulated_content.len() > preview.len() { "..." } else { "" },
+                    );
+                }
                 if self.tool_calls_by_index.is_empty() {
-                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                    // Check if the content text contains <tool_call> tags.
+                    // Local servers (llama.cpp, vLLM) may not convert the
+                    // model's tool-call output into the structured tool_calls
+                    // field, leaving them as XML tags in the content text.
+                    let parsed = Self::parse_tool_call_tags(&self.accumulated_content);
+                    if parsed.is_empty() {
+                        events.push(Ok(LanguageModelCompletionEvent::Stop(
+                            StopReason::EndTurn,
+                        )));
+                    } else {
+                        log::info!(
+                            "Parsed {} tool call(s) from <tool_call> tags in content text",
+                            parsed.len(),
+                        );
+                        for tc in parsed {
+                            match parse_tool_arguments(&tc.arguments) {
+                                Ok(input) => events.push(Ok(
+                                    LanguageModelCompletionEvent::ToolUse(
+                                        LanguageModelToolUse {
+                                            id: tc.id.into(),
+                                            name: tc.name.as_str().into(),
+                                            is_input_complete: true,
+                                            input,
+                                            raw_input: tc.arguments.clone(),
+                                            thought_signature: None,
+                                        },
+                                    ),
+                                )),
+                                Err(error) => events.push(Ok(
+                                    LanguageModelCompletionEvent::ToolUseJsonParseError {
+                                        id: tc.id.into(),
+                                        tool_name: tc.name.as_str().into(),
+                                        raw_input: tc.arguments.into(),
+                                        json_parse_error: error.to_string(),
+                                    },
+                                )),
+                            }
+                        }
+                        events.push(Ok(LanguageModelCompletionEvent::Stop(
+                            StopReason::ToolUse,
+                        )));
+                    }
                 } else {
                     log::info!(
                         "Qwen finish_reason is 'stop' but {} tool call(s) were streamed; \
@@ -869,6 +938,50 @@ impl QwenEventMapper {
         }
 
         events
+    }
+
+    /// Parse `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` tags
+    /// from the model's content text. Local servers (llama.cpp, vLLM) often
+    /// output tool calls this way instead of using the structured `tool_calls`
+    /// API field.
+    fn parse_tool_call_tags(content: &str) -> Vec<RawToolCall> {
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let mut results = Vec::new();
+        let mut search_from = 0;
+
+        while let Some(start) = content[search_from..].find("<tool_call>") {
+            let start = search_from + start + "<tool_call>".len();
+            let Some(end) = content[start..].find("</tool_call>") else {
+                break;
+            };
+            let end = start + end;
+            let body = content[start..end].trim();
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+                if let (Some(name), Some(arguments)) = (
+                    parsed.get("name").and_then(|n| n.as_str()),
+                    parsed.get("arguments"),
+                ) {
+                    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    results.push(RawToolCall {
+                        id: format!("tc_parsed_{id}"),
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    });
+                }
+            } else {
+                log::warn!(
+                    "Failed to parse <tool_call> body as JSON: {}",
+                    &body[..body.len().min(200)],
+                );
+            }
+
+            search_from = end + "</tool_call>".len();
+        }
+
+        results
     }
 }
 

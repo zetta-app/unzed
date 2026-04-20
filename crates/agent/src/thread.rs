@@ -1927,7 +1927,7 @@ impl Thread {
     ) -> Result<()> {
         let mut attempt = 0;
         let mut compaction_retries: u8 = 0;
-        let mut auto_continued = false;
+        let mut context_size_retries: u8 = 0;
         let mut intent = CompletionIntent::UserPrompt;
         loop {
             // Re-read the model and refresh tools on each iteration so that
@@ -2165,6 +2165,89 @@ impl Thread {
             }
 
             if let Some(error) = error {
+                if Self::is_context_size_error(&error) {
+                    context_size_retries += 1;
+                    if context_size_retries > 2 {
+                        log::info!(
+                            "Context size exceeded after {} compaction attempts, giving up",
+                            context_size_retries - 1
+                        );
+                        return Err(CompletionError::Other(anyhow::anyhow!(
+                            "The request exceeds the model's context window \
+                             even after compaction. Try reducing the number \
+                             of tools or using a model with a larger context."
+                        )).into());
+                    }
+
+                    log::info!(
+                        "Context size exceeded by server, attempting compaction (attempt {})",
+                        context_size_retries
+                    );
+
+                    let message_count_before =
+                        this.read_with(cx, |this, _| this.messages.len())?;
+
+                    this.update(cx, |this, cx| {
+                        this.compact_context_forced(cx);
+                    })?;
+
+                    loop {
+                        let still_compacting =
+                            this.read_with(cx, |this, _| this.is_compacting())?;
+                        if !still_compacting {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        if *cancellation_rx.borrow() {
+                            log::debug!("Turn cancelled during compaction, exiting");
+                            return Ok(());
+                        }
+                    }
+
+                    let message_count_after =
+                        this.read_with(cx, |this, _| this.messages.len())?;
+                    if message_count_after >= message_count_before {
+                        // Compaction couldn't reduce message count further.
+                        // As a last resort, aggressively mask ALL tool results
+                        // in every message (including recent ones that are
+                        // normally preserved).  Tool results often contain
+                        // large file contents that dominate the token count.
+                        let masked = this.update(cx, |this, _cx| {
+                            Self::mask_all_tool_results(&mut this.messages)
+                        })?;
+                        if masked {
+                            log::info!(
+                                "Aggressively masked all tool results as last resort, retrying"
+                            );
+                            intent = CompletionIntent::UserPrompt;
+                            attempt = 0;
+                            continue;
+                        }
+                        log::info!(
+                            "Compaction did not reduce messages (still {}), \
+                             the system prompt and tool definitions likely \
+                             exceed the model's context window on their own",
+                            message_count_after
+                        );
+                        return Err(CompletionError::Other(anyhow::anyhow!(
+                            "The request exceeds the model's context window \
+                             even after compaction. Try reducing the number \
+                             of tools or using a model with a larger context."
+                        )).into());
+                    }
+
+                    log::info!(
+                        "Compaction reduced messages from {} to {}, retrying",
+                        message_count_before,
+                        message_count_after
+                    );
+                    intent = CompletionIntent::UserPrompt;
+                    attempt = 0;
+                    continue;
+                }
+
                 attempt += 1;
                 let retry = this.update(cx, |this, cx| {
                     let user_store = this.user_store.read(cx);
@@ -2190,50 +2273,6 @@ impl Thread {
                     }
                 })?;
             } else if end_turn {
-                // Some models (notably Qwen thinking models) narrate what
-                // they intend to do ("Let me fix this:") and then stop
-                // without emitting tool_calls. Auto-continue once so the
-                // model gets another chance to act.
-                if !auto_continued {
-                    let has_text = this.read_with(cx, |this, _cx| {
-                        if let Some(message) = this.pending_message.as_ref() {
-                            return message.content.iter().any(|c| {
-                                matches!(c, AgentMessageContent::Text(t) if !t.trim().is_empty())
-                            });
-                        }
-                        this.messages.last().is_some_and(|message| {
-                            if let Message::Agent(message) = message {
-                                message.content.iter().any(|c| {
-                                    matches!(c, AgentMessageContent::Text(t) if !t.trim().is_empty())
-                                })
-                            } else {
-                                false
-                            }
-                        })
-                    })?;
-
-                    let has_tools = this.read_with(cx, |this, _cx| {
-                        this.running_turn
-                            .as_ref()
-                            .map_or(false, |turn| !turn.tools.is_empty())
-                    })?;
-
-                    if has_text && has_tools {
-                        log::info!(
-                            "Model stopped with text but tools are available, \
-                             auto-continuing with Resume (intent was {:?})",
-                            intent,
-                        );
-                        auto_continued = true;
-                        this.update(cx, |this, cx| {
-                            this.flush_pending_message(cx);
-                            this.messages.push(Message::Resume);
-                        })?;
-                        intent = CompletionIntent::UserPrompt;
-                        attempt = 0;
-                        continue;
-                    }
-                }
                 return Ok(());
             } else {
                 let has_queued = this.update(cx, |this, _| this.has_queued_message())?;
@@ -3175,6 +3214,36 @@ impl Thread {
             })
     }
 
+    /// Aggressively mask ALL tool results in ALL messages, including recent
+    /// ones.  This is a last-resort measure when normal compaction cannot
+    /// reduce the context enough because tool results (file contents, command
+    /// output, etc.) dominate the token count.
+    /// Returns `true` if any tool results were actually masked.
+    fn mask_all_tool_results(messages: &mut [Message]) -> bool {
+        let mut masked_any = false;
+        for message in messages.iter_mut() {
+            if let Message::Agent(agent_message) = message {
+                for tool_result in agent_message.tool_results.values_mut() {
+                    let placeholder: Arc<str> = format!(
+                        "[Tool result: {} (id: {})]",
+                        tool_result.tool_name, tool_result.tool_use_id
+                    )
+                    .into();
+                    if !matches!(
+                        &tool_result.content,
+                        LanguageModelToolResultContent::Text(t) if *t == placeholder
+                    ) {
+                        tool_result.content =
+                            LanguageModelToolResultContent::Text(placeholder);
+                        tool_result.output = None;
+                        masked_any = true;
+                    }
+                }
+            }
+        }
+        masked_any
+    }
+
     fn pending_message(&mut self) -> &mut AgentMessage {
         self.pending_message.get_or_insert_default()
     }
@@ -3537,6 +3606,18 @@ impl Thread {
 
     fn advance_prompt_id(&mut self) {
         self.prompt_id = PromptId::new();
+    }
+
+    fn is_context_size_error(error: &LanguageModelCompletionError) -> bool {
+        let message = error.to_string();
+        matches!(
+            error,
+            LanguageModelCompletionError::PromptTooLarge { .. }
+        ) || message.contains("Context size has been exceeded")
+            || message.contains("context_length_exceeded")
+            || message.contains("exceed_context_size_error")
+            || message.contains("exceeds the available context size")
+            || message.contains("maximum context length")
     }
 
     fn retry_strategy_for(error: &LanguageModelCompletionError) -> Option<RetryStrategy> {

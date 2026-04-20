@@ -18,7 +18,7 @@ use language_model::{
     LanguageModelRequestTool, LanguageModelTextStream, LanguageModelToolChoice,
     LanguageModelToolUse, Role, TokenUsage,
 };
-use language_models::provider::anthropic::telemetry::{
+use language_models::provider::anthropic_telemetry::{
     AnthropicCompletionType, AnthropicEventData, AnthropicEventReporter, AnthropicEventType,
 };
 use multi_buffer::MultiBufferRow;
