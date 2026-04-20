@@ -82,13 +82,14 @@ use crate::profile_selector::{ProfileProvider, ProfileSelector};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AllowAlways, AllowOnce,
-    AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
+    AuthorizeToolCall, ClearMessageQueue, CompactContext, CycleFavoriteModels, CycleModeSelector,
     CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
     ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
     ToggleProfileSelector, ToggleThinkingEffortMenu, ToggleThinkingMode, UndoLastReject,
+    ViewCompactSummary,
 };
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);

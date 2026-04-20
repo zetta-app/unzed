@@ -57,6 +57,10 @@ pub enum Model {
     Qwen3CoderPlus,
     #[serde(rename = "qwen-plus")]
     QwenPlus,
+    #[serde(rename = "qwen3.5-plus")]
+    Qwen35Plus,
+    #[serde(rename = "qwen3.5-flash")]
+    Qwen35Flash,
     #[serde(rename = "custom")]
     Custom {
         name: String,
@@ -77,6 +81,8 @@ impl Model {
             "qwen3-32b" => Ok(Self::Qwen3_32B),
             "qwen3-coder-plus" => Ok(Self::Qwen3CoderPlus),
             "qwen-plus" => Ok(Self::QwenPlus),
+            "qwen3.5-plus" => Ok(Self::Qwen35Plus),
+            "qwen3.5-flash" => Ok(Self::Qwen35Flash),
             _ => anyhow::bail!("invalid model id {id}"),
         }
     }
@@ -87,6 +93,8 @@ impl Model {
             Self::Qwen3_32B => "qwen3-32b",
             Self::Qwen3CoderPlus => "qwen3-coder-plus",
             Self::QwenPlus => "qwen-plus",
+            Self::Qwen35Plus => "qwen3.5-plus",
+            Self::Qwen35Flash => "qwen3.5-flash",
             Self::Custom { name, .. } => name,
         }
     }
@@ -97,6 +105,8 @@ impl Model {
             Self::Qwen3_32B => "Qwen3 32B",
             Self::Qwen3CoderPlus => "Qwen3 Coder Plus",
             Self::QwenPlus => "Qwen Plus",
+            Self::Qwen35Plus => "Qwen3.5 Plus",
+            Self::Qwen35Flash => "Qwen3.5 Flash",
             Self::Custom {
                 name, display_name, ..
             } => display_name.as_ref().unwrap_or(name).as_str(),
@@ -107,13 +117,19 @@ impl Model {
         match self {
             Self::Qwen3_235B | Self::Qwen3_32B => 128_000,
             Self::Qwen3CoderPlus | Self::QwenPlus => 131_072,
+            Self::Qwen35Plus | Self::Qwen35Flash => 131_072,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
 
     pub fn max_output_tokens(&self) -> Option<u64> {
         match self {
-            Self::Qwen3_235B | Self::Qwen3_32B | Self::Qwen3CoderPlus | Self::QwenPlus => None,
+            Self::Qwen3_235B
+            | Self::Qwen3_32B
+            | Self::Qwen3CoderPlus
+            | Self::QwenPlus
+            | Self::Qwen35Plus
+            | Self::Qwen35Flash => None,
             Self::Custom {
                 max_output_tokens, ..
             } => *max_output_tokens,
@@ -122,10 +138,23 @@ impl Model {
 
     pub fn supports_thinking(&self) -> bool {
         match self {
-            Self::Qwen3_235B | Self::Qwen3_32B | Self::Qwen3CoderPlus | Self::QwenPlus => true,
+            Self::Qwen3_235B
+            | Self::Qwen3_32B
+            | Self::Qwen3CoderPlus
+            | Self::QwenPlus
+            | Self::Qwen35Plus
+            | Self::Qwen35Flash => true,
             Self::Custom { .. } => false,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    None,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,6 +170,8 @@ pub struct Request {
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,18 +251,29 @@ pub struct Usage {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StreamResponse {
     pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
     pub choices: Vec<StreamChoice>,
+    #[serde(default)]
     pub usage: Option<Usage>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StreamChoice {
     pub index: u32,
-    pub delta: StreamDelta,
+    #[serde(default)]
+    pub delta: Option<StreamDelta>,
     pub finish_reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StreamError {
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum StreamResult {
+    Ok(StreamResponse),
+    Err { error: StreamError },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -277,20 +319,40 @@ pub async fn stream_completion(
         let reader = BufReader::new(response.into_body());
         Ok(reader
             .lines()
+            .take_while(|line| {
+                let is_done = match line {
+                    Ok(line) => {
+                        line.starts_with("data: [DONE]") || line.starts_with("data:[DONE]")
+                    }
+                    Err(_) => false,
+                };
+                async move { !is_done }
+            })
             .filter_map(|line| async move {
                 match line {
                     Ok(line) => {
-                        let line = line.strip_prefix("data: ")?;
-                        if line == "[DONE]" {
-                            None
-                        } else {
-                            match serde_json::from_str(line) {
-                                Ok(response) => Some(Ok(response)),
-                                Err(error) => Some(Err(anyhow!(error))),
+                        let line = line
+                            .strip_prefix("data: ")
+                            .or_else(|| line.strip_prefix("data:"))?;
+                        log::debug!("Qwen SSE raw: {}", line);
+                        match serde_json::from_str(line) {
+                            Ok(StreamResult::Ok(response)) => Some(Ok(response)),
+                            Ok(StreamResult::Err { error }) => {
+                                log::error!("Qwen SSE inline error: {}", error.message);
+                                Some(Err(anyhow!(error.message)))
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "Qwen stream: failed to deserialize SSE chunk: {error}; raw line: {line}"
+                                );
+                                Some(Err(anyhow!(error)))
                             }
                         }
                     }
-                    Err(error) => Some(Err(anyhow!(error))),
+                    Err(error) => {
+                        log::error!("Qwen stream: error reading line: {error}");
+                        Some(Err(anyhow!(error)))
+                    }
                 }
             })
             .boxed())

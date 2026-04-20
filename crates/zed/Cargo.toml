@@ -12,9 +12,43 @@ default-run = "zed"
 workspace = true
 
 [features]
+default = ["all-providers"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
+# AI provider features - all enabled by default
+provider-anthropic = ["language_models/anthropic"]
+provider-bedrock = ["language_models/bedrock"]
+provider-cloud = ["language_models/cloud"]
+provider-copilot-chat = ["language_models/copilot_chat"]
+provider-deepseek = ["language_models/deepseek"]
+provider-google = ["language_models/google"]
+provider-lmstudio = ["language_models/lmstudio"]
+provider-mistral = ["language_models/mistral"]
+provider-ollama = ["language_models/ollama"]
+provider-open-ai = ["language_models/open_ai"]
+provider-open-router = ["language_models/open_router"]
+provider-opencode = ["language_models/opencode"]
+provider-vercel = ["language_models/vercel"]
+provider-vercel-ai-gateway = ["language_models/vercel_ai_gateway"]
+provider-x-ai = ["language_models/x_ai"]
+all-providers = [
+    "provider-anthropic",
+    "provider-bedrock",
+    "provider-cloud",
+    "provider-copilot-chat",
+    "provider-deepseek",
+    "provider-google",
+    "provider-lmstudio",
+    "provider-mistral",
+    "provider-ollama",
+    "provider-open-ai",
+    "provider-open-router",
+    "provider-opencode",
+    "provider-vercel",
+    "provider-vercel-ai-gateway",
+    "provider-x-ai",
+]
 test-support = [
     "gpui/test-support",
     "gpui_platform/screen-capture",

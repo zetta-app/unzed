@@ -693,8 +693,49 @@ impl OpenRouterEventMapper {
 
         match choice.finish_reason.as_deref() {
             Some("stop") => {
-                // Don't emit reasoning_details here - already emitted immediately when captured
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                if self.tool_calls_by_index.is_empty() {
+                    // Don't emit reasoning_details here - already emitted immediately when captured
+                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                } else {
+                    log::info!(
+                        "OpenRouter finish_reason is 'stop' but {} tool call(s) were streamed; \
+                         finalizing them (server likely uses 'stop' instead of 'tool_calls')",
+                        self.tool_calls_by_index.len()
+                    );
+                    events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
+                        match parse_tool_arguments(&tool_call.arguments) {
+                            Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
+                                LanguageModelToolUse {
+                                    id: tool_call.id.clone().into(),
+                                    name: tool_call.name.as_str().into(),
+                                    is_input_complete: true,
+                                    input,
+                                    raw_input: tool_call.arguments.clone(),
+                                    thought_signature: tool_call.thought_signature.clone(),
+                                },
+                            )),
+                            Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
+                                id: tool_call.id.clone().into(),
+                                tool_name: tool_call.name.as_str().into(),
+                                raw_input: tool_call.arguments.clone().into(),
+                                json_parse_error: error.to_string(),
+                            }),
+                        }
+                    }));
+                    // Don't emit reasoning_details here - already emitted immediately when captured
+                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
+                }
+            }
+            Some("length") => {
+                if !self.tool_calls_by_index.is_empty() {
+                    log::warn!(
+                        "OpenRouter finish_reason is 'length' but {} tool call(s) were being streamed and will be dropped",
+                        self.tool_calls_by_index.len()
+                    );
+                }
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
             }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {

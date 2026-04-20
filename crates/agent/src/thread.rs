@@ -975,6 +975,17 @@ pub struct Thread {
     context_compact_summary: Option<String>,
     /// Task for an in-progress context compaction.
     pending_compaction: Option<Task<()>>,
+    /// Number of messages before the last compaction, for displaying reduction info.
+    pre_compaction_message_count: Option<usize>,
+    /// When a summarization compaction is in progress, the number of messages
+    /// from the front of `self.messages` that are being summarized. These
+    /// messages are excluded from `build_request_messages` so that new prompts
+    /// sent during compaction don't include the soon-to-be-removed history.
+    compacting_message_count: usize,
+    /// Set to `true` when a summarization compaction just completed and the
+    /// summary should be shown as a visible message in the UI thread.
+    /// Consumed (reset to `false`) by the event handler.
+    has_new_compaction_summary: bool,
 }
 
 impl Thread {
@@ -1097,6 +1108,9 @@ impl Thread {
             running_subagents: Vec::new(),
             context_compact_summary: None,
             pending_compaction: None,
+            pre_compaction_message_count: None,
+            compacting_message_count: 0,
+            has_new_compaction_summary: false,
         }
     }
 
@@ -1331,6 +1345,9 @@ impl Thread {
             running_subagents: Vec::new(),
             context_compact_summary: db_thread.context_compact_summary,
             pending_compaction: None,
+            pre_compaction_message_count: None,
+            compacting_message_count: 0,
+            has_new_compaction_summary: false,
         }
     }
 
@@ -1909,6 +1926,8 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let mut attempt = 0;
+        let mut compaction_retries: u8 = 0;
+        let mut context_size_retries: u8 = 0;
         let mut intent = CompletionIntent::UserPrompt;
         loop {
             // Re-read the model and refresh tools on each iteration so that
@@ -1933,16 +1952,23 @@ impl Thread {
                 attempt
             );
 
-            log::debug!("Calling model.stream_completion, attempt {}", attempt);
+            log::info!("Calling model.stream_completion, intent={:?}, attempt={}", intent, attempt);
 
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
-                Ok(events) => (events.fuse(), None),
-                Err(err) => (stream::empty().boxed().fuse(), Some(err)),
+                Ok(events) => {
+                    log::info!("stream_completion returned stream successfully");
+                    (events.fuse(), None)
+                }
+                Err(err) => {
+                    log::error!("stream_completion failed: {:?}", err);
+                    (stream::empty().boxed().fuse(), Some(err))
+                }
             };
             let mut tool_results: FuturesUnordered<Task<LanguageModelToolResult>> =
                 FuturesUnordered::new();
             let mut early_tool_results: Vec<LanguageModelToolResult> = Vec::new();
             let mut cancelled = false;
+            let mut max_tokens_hit = false;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
                 let first_event = futures::select! {
@@ -1979,6 +2005,7 @@ impl Thread {
                     }
                 };
                 let Some(first_event) = first_event else {
+                    log::info!("Completion stream ended");
                     break;
                 };
 
@@ -2024,8 +2051,23 @@ impl Thread {
 
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
-                    error = Some(err.downcast()?);
-                    break;
+                    match err.downcast::<CompletionError>() {
+                        Ok(CompletionError::MaxTokens) => {
+                            max_tokens_hit = true;
+                            break;
+                        }
+                        Ok(CompletionError::Refusal) => {
+                            return Err(CompletionError::Refusal.into());
+                        }
+                        Ok(CompletionError::Other(err)) => {
+                            error = Some(err.downcast()?);
+                            break;
+                        }
+                        Err(err) => {
+                            error = Some(err.downcast()?);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -2050,6 +2092,11 @@ impl Thread {
             })?;
 
             let end_turn = tool_results.is_empty() && early_tool_results.is_empty();
+            if end_turn {
+                log::info!(
+                    "Turn ending with no pending tool calls (model produced text only)"
+                );
+            }
 
             for tool_result in early_tool_results {
                 Self::process_tool_result(this, event_stream, cx, tool_result)?;
@@ -2070,7 +2117,137 @@ impl Thread {
                 return Ok(());
             }
 
+            if max_tokens_hit {
+                compaction_retries += 1;
+                if compaction_retries > 2 {
+                    log::info!("Max tokens reached after {} compaction attempts, giving up", compaction_retries - 1);
+                    return Err(CompletionError::MaxTokens.into());
+                }
+
+                log::info!(
+                    "Max tokens reached, attempting context compaction before retry (attempt {})",
+                    compaction_retries
+                );
+
+                let message_count_before = this.read_with(cx, |this, _| this.messages.len())?;
+
+                this.update(cx, |this, cx| {
+                    this.compact_context_forced(cx);
+                })?;
+
+                // If async compaction was started, wait for it to finish.
+                loop {
+                    let still_compacting = this.read_with(cx, |this, _| this.is_compacting())?;
+                    if !still_compacting {
+                        break;
+                    }
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    if *cancellation_rx.borrow() {
+                        log::debug!("Turn cancelled during compaction, exiting");
+                        return Ok(());
+                    }
+                }
+
+                let message_count_after = this.read_with(cx, |this, _| this.messages.len())?;
+                if message_count_after >= message_count_before {
+                    log::info!("Context compaction did not reduce messages, reporting max tokens error");
+                    return Err(CompletionError::MaxTokens.into());
+                }
+
+                log::info!(
+                    "Context compaction reduced messages from {} to {}, retrying",
+                    message_count_before,
+                    message_count_after
+                );
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
+                continue;
+            }
+
             if let Some(error) = error {
+                if Self::is_context_size_error(&error) {
+                    context_size_retries += 1;
+                    if context_size_retries > 2 {
+                        log::info!(
+                            "Context size exceeded after {} compaction attempts, giving up",
+                            context_size_retries - 1
+                        );
+                        return Err(CompletionError::Other(anyhow::anyhow!(
+                            "The request exceeds the model's context window \
+                             even after compaction. Try reducing the number \
+                             of tools or using a model with a larger context."
+                        )).into());
+                    }
+
+                    log::info!(
+                        "Context size exceeded by server, attempting compaction (attempt {})",
+                        context_size_retries
+                    );
+
+                    let message_count_before =
+                        this.read_with(cx, |this, _| this.messages.len())?;
+
+                    this.update(cx, |this, cx| {
+                        this.compact_context_forced(cx);
+                    })?;
+
+                    loop {
+                        let still_compacting =
+                            this.read_with(cx, |this, _| this.is_compacting())?;
+                        if !still_compacting {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        if *cancellation_rx.borrow() {
+                            log::debug!("Turn cancelled during compaction, exiting");
+                            return Ok(());
+                        }
+                    }
+
+                    let message_count_after =
+                        this.read_with(cx, |this, _| this.messages.len())?;
+                    if message_count_after >= message_count_before {
+                        // Compaction couldn't reduce message count further.
+                        // As a last resort, aggressively mask ALL tool results
+                        // in every message (including recent ones that are
+                        // normally preserved).  Tool results often contain
+                        // large file contents that dominate the token count.
+                        let masked = this.update(cx, |this, _cx| {
+                            Self::mask_all_tool_results(&mut this.messages)
+                        })?;
+                        if masked {
+                            log::info!(
+                                "Aggressively masked all tool results as last resort, retrying"
+                            );
+                            intent = CompletionIntent::UserPrompt;
+                            attempt = 0;
+                            continue;
+                        }
+                        log::info!(
+                            "Compaction did not reduce messages (still {}), \
+                             the system prompt and tool definitions likely \
+                             exceed the model's context window on their own",
+                            message_count_after
+                        );
+                        return Err(CompletionError::Other(anyhow::anyhow!(
+                            "The request exceeds the model's context window \
+                             even after compaction. Try reducing the number \
+                             of tools or using a model with a larger context."
+                        )).into());
+                    }
+
+                    log::info!(
+                        "Compaction reduced messages from {} to {}, retrying",
+                        message_count_before,
+                        message_count_after
+                    );
+                    intent = CompletionIntent::UserPrompt;
+                    attempt = 0;
+                    continue;
+                }
+
                 attempt += 1;
                 let retry = this.update(cx, |this, cx| {
                     let user_store = this.user_store.read(cx);
@@ -2256,9 +2433,20 @@ impl Thread {
                 );
                 self.update_token_usage(usage, cx);
             }
-            Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
-            Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
-            Stop(StopReason::ToolUse | StopReason::EndTurn) => {}
+            Stop(StopReason::Refusal) => {
+                log::info!("Model stopped with reason: Refusal");
+                return Err(CompletionError::Refusal.into());
+            }
+            Stop(StopReason::MaxTokens) => {
+                log::info!("Model stopped with reason: MaxTokens");
+                return Err(CompletionError::MaxTokens.into());
+            }
+            Stop(StopReason::ToolUse) => {
+                log::info!("Model stopped with reason: ToolUse");
+            }
+            Stop(StopReason::EndTurn) => {
+                log::info!("Model stopped with reason: EndTurn");
+            }
             Started | Queued { .. } => {}
         }
 
@@ -2705,9 +2893,40 @@ impl Thread {
         self.context_compact_summary.as_deref()
     }
 
+    /// Replaces the stored context compaction summary with the given text.
+    /// Passing `None` clears the summary entirely.
+    pub fn set_context_compact_summary(
+        &mut self,
+        summary: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_compact_summary = summary;
+        self.clear_summary();
+        cx.emit(ContextCompacted);
+        cx.notify();
+    }
+
     /// Returns whether a context compaction is currently in progress.
     pub fn is_compacting(&self) -> bool {
         self.pending_compaction.is_some()
+    }
+
+    /// Returns the number of messages before the last compaction, if available.
+    /// Together with the current message count, this lets the UI show how much
+    /// the context was reduced.
+    pub fn pre_compaction_message_count(&self) -> Option<usize> {
+        self.pre_compaction_message_count
+    }
+
+    /// Returns the number of messages currently in the thread.
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Returns `true` if a compaction summary was just produced and should be
+    /// displayed in the UI. Calling this consumes the flag.
+    pub fn take_new_compaction_summary(&mut self) -> bool {
+        std::mem::replace(&mut self.has_new_compaction_summary, false)
     }
 
     /// Compact the conversation context by summarizing all messages before the
@@ -2719,36 +2938,66 @@ impl Thread {
     /// - `mask_tool_outputs`: replaces tool outputs with short placeholders
     /// - `hybrid_mask_then_summarize`: masks first, then summarizes if needed
     pub fn compact_context(&mut self, cx: &mut Context<Self>) {
+        self.compact_context_inner(false, cx);
+    }
+
+    /// Manually triggered compaction that ignores the preserve_recent_messages
+    /// constraint. Will compact all messages except the very last one.
+    pub fn compact_context_forced(&mut self, cx: &mut Context<Self>) {
+        self.compact_context_inner(true, cx);
+    }
+
+    fn compact_context_inner(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.pending_compaction.is_some() {
+            log::info!("compact_context: already compacting, skipping");
             return;
         }
+
+        self.pre_compaction_message_count = Some(self.messages.len());
 
         let config = AgentSettings::get_global(cx).context_compact.clone();
         let method = config.method.unwrap_or_default();
 
+        log::info!(
+            "compact_context: method={:?}, messages={}, preserve_recent={}, force={}",
+            method,
+            self.messages.len(),
+            config.preserve_recent_messages.unwrap_or(1),
+            force
+        );
+
         match method {
             ContextCompactMethod::MaskToolOutputs => {
-                self.compact_by_masking_tool_outputs(cx);
+                self.compact_by_masking_tool_outputs(force, cx);
             }
             ContextCompactMethod::Summarize => {
-                self.compact_by_summarization(&config, cx);
+                self.compact_by_summarization(&config, force, cx);
             }
             ContextCompactMethod::HybridMaskThenSummarize => {
-                // First pass: mask tool outputs synchronously
-                self.compact_by_masking_tool_outputs(cx);
-                // Second pass: summarize if still needed
-                self.compact_by_summarization(&config, cx);
+                self.compact_by_masking_tool_outputs(force, cx);
+                self.compact_by_summarization(&config, force, cx);
             }
         }
     }
 
     /// Replace tool call outputs in older messages with short placeholders.
     /// This is a synchronous, zero-LLM-cost compaction method.
-    fn compact_by_masking_tool_outputs(&mut self, cx: &mut Context<Self>) {
+    fn compact_by_masking_tool_outputs(&mut self, force: bool, cx: &mut Context<Self>) {
         let config = AgentSettings::get_global(cx).context_compact.clone();
         let preserve_count = config.preserve_recent_messages.unwrap_or(1);
-        let boundary = self.compaction_boundary_with_preserve(preserve_count);
+        let boundary = if force {
+            self.forced_compaction_boundary()
+        } else {
+            self.compaction_boundary_with_preserve(preserve_count)
+        };
+        log::info!(
+            "compact_by_masking_tool_outputs: boundary={}, messages={}, force={}",
+            boundary,
+            self.messages.len(),
+            force
+        );
         if boundary == 0 {
+            log::info!("compact_by_masking_tool_outputs: nothing to mask (boundary=0)");
             return;
         }
 
@@ -2783,6 +3032,7 @@ impl Thread {
     fn compact_by_summarization(
         &mut self,
         config: &ContextCompactConfig,
+        force: bool,
         cx: &mut Context<Self>,
     ) {
         if self.pending_compaction.is_some() {
@@ -2799,9 +3049,19 @@ impl Thread {
         };
 
         let preserve_count = config.preserve_recent_messages.unwrap_or(1);
-        let compact_up_to = self.compaction_boundary_with_preserve(preserve_count);
+        let compact_up_to = if force {
+            self.forced_compaction_boundary()
+        } else {
+            self.compaction_boundary_with_preserve(preserve_count)
+        };
+        log::info!(
+            "compact_by_summarization: compact_up_to={}, messages={}, force={}",
+            compact_up_to,
+            self.messages.len(),
+            force
+        );
         if compact_up_to == 0 {
-            log::debug!("Nothing to compact");
+            log::info!("compact_by_summarization: nothing to compact (boundary=0)");
             return;
         }
 
@@ -2849,6 +3109,8 @@ impl Thread {
             reasoning_details: None,
         });
 
+        self.compacting_message_count = compact_up_to;
+
         self.pending_compaction = Some(cx.spawn(async move |this, cx| {
             let generate = async {
                 let mut summary = String::new();
@@ -2876,6 +3138,8 @@ impl Thread {
 
                         this.context_compact_summary = Some(summary);
                         this.pending_compaction = None;
+                        this.compacting_message_count = 0;
+                        this.has_new_compaction_summary = true;
                         this.clear_summary();
                         cx.emit(ContextCompacted);
                         cx.notify();
@@ -2886,6 +3150,7 @@ impl Thread {
                     log::error!("Context compaction failed: {:?}", error);
                     this.update(cx, |this, cx| {
                         this.pending_compaction = None;
+                        this.compacting_message_count = 0;
                         cx.notify();
                     })
                     .ok();
@@ -2913,6 +3178,31 @@ impl Thread {
         keep_from
     }
 
+    /// For forced (manual) compaction: compact everything except the last
+    /// user message and everything after it. If there's only one user message,
+    /// compact everything before it (the agent messages that precede it).
+    /// If there are no user messages, compact all but the last message.
+    fn forced_compaction_boundary(&self) -> usize {
+        if self.messages.len() <= 1 {
+            return 0;
+        }
+
+        // Find the last user message index
+        let last_user_idx = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| matches!(m, Message::User(_)).then_some(i));
+
+        match last_user_idx {
+            Some(idx) if idx > 0 => idx,
+            // Only one user message at index 0, or no user messages:
+            // compact all but the last message
+            _ => self.messages.len().saturating_sub(1),
+        }
+    }
+
     fn last_user_message(&self) -> Option<&UserMessage> {
         self.messages
             .iter()
@@ -2922,6 +3212,36 @@ impl Thread {
                 Message::Agent(_) => None,
                 Message::Resume => None,
             })
+    }
+
+    /// Aggressively mask ALL tool results in ALL messages, including recent
+    /// ones.  This is a last-resort measure when normal compaction cannot
+    /// reduce the context enough because tool results (file contents, command
+    /// output, etc.) dominate the token count.
+    /// Returns `true` if any tool results were actually masked.
+    fn mask_all_tool_results(messages: &mut [Message]) -> bool {
+        let mut masked_any = false;
+        for message in messages.iter_mut() {
+            if let Message::Agent(agent_message) = message {
+                for tool_result in agent_message.tool_results.values_mut() {
+                    let placeholder: Arc<str> = format!(
+                        "[Tool result: {} (id: {})]",
+                        tool_result.tool_name, tool_result.tool_use_id
+                    )
+                    .into();
+                    if !matches!(
+                        &tool_result.content,
+                        LanguageModelToolResultContent::Text(t) if *t == placeholder
+                    ) {
+                        tool_result.content =
+                            LanguageModelToolResultContent::Text(placeholder);
+                        tool_result.output = None;
+                        masked_any = true;
+                    }
+                }
+            }
+        }
+        masked_any
     }
 
     fn pending_message(&mut self) -> &mut AgentMessage {
@@ -3237,7 +3557,10 @@ impl Thread {
             });
         }
 
-        for message in &self.messages {
+        // Skip messages that are currently being compacted (summarized).
+        // They will be drained once the summarization completes.
+        let skip = self.compacting_message_count;
+        for message in &self.messages[skip..] {
             messages.extend(message.to_request());
         }
 
@@ -3283,6 +3606,18 @@ impl Thread {
 
     fn advance_prompt_id(&mut self) {
         self.prompt_id = PromptId::new();
+    }
+
+    fn is_context_size_error(error: &LanguageModelCompletionError) -> bool {
+        let message = error.to_string();
+        matches!(
+            error,
+            LanguageModelCompletionError::PromptTooLarge { .. }
+        ) || message.contains("Context size has been exceeded")
+            || message.contains("context_length_exceeded")
+            || message.contains("exceed_context_size_error")
+            || message.contains("exceeds the available context size")
+            || message.contains("maximum context length")
     }
 
     fn retry_strategy_for(error: &LanguageModelCompletionError) -> Option<RetryStrategy> {

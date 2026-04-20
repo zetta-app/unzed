@@ -410,20 +410,23 @@ pub async fn stream_chat_completion(
         let reader = BufReader::new(response.into_body());
         Ok(reader
             .lines()
+            .take_while(|line| {
+                let is_done = match line {
+                    Ok(line) => line.starts_with("data: [DONE]"),
+                    Err(_) => false,
+                };
+                async move { !is_done }
+            })
             .filter_map(|line| async move {
                 match line {
                     Ok(line) => {
                         let line = line.strip_prefix("data: ")?;
-                        if line == "[DONE]" {
-                            None
-                        } else {
-                            match serde_json::from_str(line) {
-                                Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
-                                Ok(ResponseStreamResult::Err { error, .. }) => {
-                                    Some(Err(anyhow!(error.message)))
-                                }
-                                Err(error) => Some(Err(anyhow!(error))),
+                        match serde_json::from_str(line) {
+                            Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                            Ok(ResponseStreamResult::Err { error, .. }) => {
+                                Some(Err(anyhow!(error.message)))
                             }
+                            Err(error) => Some(Err(anyhow!(error))),
                         }
                     }
                     Err(error) => Some(Err(anyhow!(error))),

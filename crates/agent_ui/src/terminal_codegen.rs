@@ -2,7 +2,7 @@ use crate::inline_prompt_editor::CodegenStatus;
 use futures::{SinkExt, StreamExt, channel::mpsc};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use language_model::{ConfiguredModel, LanguageModelRegistry, LanguageModelRequest};
-use language_models::provider::anthropic::telemetry::{
+use language_models::provider::anthropic_telemetry::{
     AnthropicCompletionType, AnthropicEventData, AnthropicEventReporter, AnthropicEventType,
 };
 use std::time::Instant;

@@ -161,6 +161,14 @@ pub enum AgentThreadEntry {
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
     CompletedPlan(Vec<PlanEntry>),
+    /// A compaction summary shown after context was compacted.
+    CompactionSummary(CompactionSummaryEntry),
+}
+
+/// A visible entry showing the compacted context summary.
+#[derive(Debug)]
+pub struct CompactionSummaryEntry {
+    pub block: ContentBlock,
 }
 
 impl AgentThreadEntry {
@@ -170,6 +178,7 @@ impl AgentThreadEntry {
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
             Self::CompletedPlan(_) => false,
+            Self::CompactionSummary(_) => false,
         }
     }
 
@@ -185,6 +194,12 @@ impl AgentThreadEntry {
                     md.push_str(&format!("- [x] {}\n", source));
                 }
                 md
+            }
+            Self::CompactionSummary(entry) => {
+                format!(
+                    "## Context Compacted\n\n{}\n\n",
+                    entry.block.to_markdown(cx)
+                )
             }
         }
     }
@@ -1367,7 +1382,8 @@ impl AcpThread {
                 }) => return true,
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
         false
@@ -1391,7 +1407,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
 
@@ -1410,7 +1427,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
 
@@ -1421,7 +1439,9 @@ impl AcpThread {
         for entry in self.entries.iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(..) => return false,
-                AgentThreadEntry::AssistantMessage(..) | AgentThreadEntry::CompletedPlan(..) => {
+                AgentThreadEntry::AssistantMessage(..)
+                | AgentThreadEntry::CompletedPlan(..)
+                | AgentThreadEntry::CompactionSummary(..) => {
                     continue;
                 }
                 AgentThreadEntry::ToolCall(..) => return true,
@@ -1775,6 +1795,22 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
+    }
+
+    /// Adds a compaction summary as a visible entry in the thread.
+    pub fn push_compaction_summary(&mut self, summary: &str, cx: &mut Context<Self>) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let block = ContentBlock::new(
+            acp::ContentBlock::Text(acp::TextContent::new(summary)),
+            &language_registry,
+            path_style,
+            cx,
+        );
+        self.push_entry(
+            AgentThreadEntry::CompactionSummary(CompactionSummaryEntry { block }),
+            cx,
+        );
     }
 
     pub fn can_set_title(&mut self, cx: &mut Context<Self>) -> bool {
