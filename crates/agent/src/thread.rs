@@ -1926,6 +1926,8 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let mut attempt = 0;
+        let mut compaction_retries: u8 = 0;
+        let mut auto_continued = false;
         let mut intent = CompletionIntent::UserPrompt;
         loop {
             // Re-read the model and refresh tools on each iteration so that
@@ -1950,16 +1952,23 @@ impl Thread {
                 attempt
             );
 
-            log::debug!("Calling model.stream_completion, attempt {}", attempt);
+            log::info!("Calling model.stream_completion, intent={:?}, attempt={}", intent, attempt);
 
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
-                Ok(events) => (events.fuse(), None),
-                Err(err) => (stream::empty().boxed().fuse(), Some(err)),
+                Ok(events) => {
+                    log::info!("stream_completion returned stream successfully");
+                    (events.fuse(), None)
+                }
+                Err(err) => {
+                    log::error!("stream_completion failed: {:?}", err);
+                    (stream::empty().boxed().fuse(), Some(err))
+                }
             };
             let mut tool_results: FuturesUnordered<Task<LanguageModelToolResult>> =
                 FuturesUnordered::new();
             let mut early_tool_results: Vec<LanguageModelToolResult> = Vec::new();
             let mut cancelled = false;
+            let mut max_tokens_hit = false;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
                 let first_event = futures::select! {
@@ -1996,6 +2005,7 @@ impl Thread {
                     }
                 };
                 let Some(first_event) = first_event else {
+                    log::info!("Completion stream ended");
                     break;
                 };
 
@@ -2041,8 +2051,23 @@ impl Thread {
 
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
-                    error = Some(err.downcast()?);
-                    break;
+                    match err.downcast::<CompletionError>() {
+                        Ok(CompletionError::MaxTokens) => {
+                            max_tokens_hit = true;
+                            break;
+                        }
+                        Ok(CompletionError::Refusal) => {
+                            return Err(CompletionError::Refusal.into());
+                        }
+                        Ok(CompletionError::Other(err)) => {
+                            error = Some(err.downcast()?);
+                            break;
+                        }
+                        Err(err) => {
+                            error = Some(err.downcast()?);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -2067,6 +2092,11 @@ impl Thread {
             })?;
 
             let end_turn = tool_results.is_empty() && early_tool_results.is_empty();
+            if end_turn {
+                log::info!(
+                    "Turn ending with no pending tool calls (model produced text only)"
+                );
+            }
 
             for tool_result in early_tool_results {
                 Self::process_tool_result(this, event_stream, cx, tool_result)?;
@@ -2085,6 +2115,53 @@ impl Thread {
             if cancelled {
                 log::debug!("Turn cancelled by user, exiting");
                 return Ok(());
+            }
+
+            if max_tokens_hit {
+                compaction_retries += 1;
+                if compaction_retries > 2 {
+                    log::info!("Max tokens reached after {} compaction attempts, giving up", compaction_retries - 1);
+                    return Err(CompletionError::MaxTokens.into());
+                }
+
+                log::info!(
+                    "Max tokens reached, attempting context compaction before retry (attempt {})",
+                    compaction_retries
+                );
+
+                let message_count_before = this.read_with(cx, |this, _| this.messages.len())?;
+
+                this.update(cx, |this, cx| {
+                    this.compact_context_forced(cx);
+                })?;
+
+                // If async compaction was started, wait for it to finish.
+                loop {
+                    let still_compacting = this.read_with(cx, |this, _| this.is_compacting())?;
+                    if !still_compacting {
+                        break;
+                    }
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    if *cancellation_rx.borrow() {
+                        log::debug!("Turn cancelled during compaction, exiting");
+                        return Ok(());
+                    }
+                }
+
+                let message_count_after = this.read_with(cx, |this, _| this.messages.len())?;
+                if message_count_after >= message_count_before {
+                    log::info!("Context compaction did not reduce messages, reporting max tokens error");
+                    return Err(CompletionError::MaxTokens.into());
+                }
+
+                log::info!(
+                    "Context compaction reduced messages from {} to {}, retrying",
+                    message_count_before,
+                    message_count_after
+                );
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
+                continue;
             }
 
             if let Some(error) = error {
@@ -2113,6 +2190,50 @@ impl Thread {
                     }
                 })?;
             } else if end_turn {
+                // Some models (notably Qwen thinking models) narrate what
+                // they intend to do ("Let me fix this:") and then stop
+                // without emitting tool_calls. Auto-continue once so the
+                // model gets another chance to act.
+                if !auto_continued {
+                    let has_text = this.read_with(cx, |this, _cx| {
+                        if let Some(message) = this.pending_message.as_ref() {
+                            return message.content.iter().any(|c| {
+                                matches!(c, AgentMessageContent::Text(t) if !t.trim().is_empty())
+                            });
+                        }
+                        this.messages.last().is_some_and(|message| {
+                            if let Message::Agent(message) = message {
+                                message.content.iter().any(|c| {
+                                    matches!(c, AgentMessageContent::Text(t) if !t.trim().is_empty())
+                                })
+                            } else {
+                                false
+                            }
+                        })
+                    })?;
+
+                    let has_tools = this.read_with(cx, |this, _cx| {
+                        this.running_turn
+                            .as_ref()
+                            .map_or(false, |turn| !turn.tools.is_empty())
+                    })?;
+
+                    if has_text && has_tools {
+                        log::info!(
+                            "Model stopped with text but tools are available, \
+                             auto-continuing with Resume (intent was {:?})",
+                            intent,
+                        );
+                        auto_continued = true;
+                        this.update(cx, |this, cx| {
+                            this.flush_pending_message(cx);
+                            this.messages.push(Message::Resume);
+                        })?;
+                        intent = CompletionIntent::UserPrompt;
+                        attempt = 0;
+                        continue;
+                    }
+                }
                 return Ok(());
             } else {
                 let has_queued = this.update(cx, |this, _| this.has_queued_message())?;
@@ -2273,9 +2394,20 @@ impl Thread {
                 );
                 self.update_token_usage(usage, cx);
             }
-            Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
-            Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
-            Stop(StopReason::ToolUse | StopReason::EndTurn) => {}
+            Stop(StopReason::Refusal) => {
+                log::info!("Model stopped with reason: Refusal");
+                return Err(CompletionError::Refusal.into());
+            }
+            Stop(StopReason::MaxTokens) => {
+                log::info!("Model stopped with reason: MaxTokens");
+                return Err(CompletionError::MaxTokens.into());
+            }
+            Stop(StopReason::ToolUse) => {
+                log::info!("Model stopped with reason: ToolUse");
+            }
+            Stop(StopReason::EndTurn) => {
+                log::info!("Model stopped with reason: EndTurn");
+            }
             Started | Queued { .. } => {}
         }
 

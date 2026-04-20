@@ -184,6 +184,8 @@ impl LanguageModelProvider for QwenLanguageModelProvider {
             ("qwen3-32b", qwen::Model::Qwen3_32B),
             ("qwen3-coder-plus", qwen::Model::Qwen3CoderPlus),
             ("qwen-plus", qwen::Model::QwenPlus),
+            ("qwen3.5-plus", qwen::Model::Qwen35Plus),
+            ("qwen3.5-flash", qwen::Model::Qwen35Flash),
         ];
 
         for (name, model) in builtins {
@@ -324,7 +326,7 @@ impl LanguageModel for QwenLanguageModel {
         self.settings_model
             .as_ref()
             .and_then(|m| m.enable_thinking)
-            .unwrap_or(false)
+            .unwrap_or_else(|| self.model.supports_thinking())
     }
 
     fn telemetry_id(&self) -> String {
@@ -470,18 +472,24 @@ pub fn into_qwen(
         }
     }
 
-    // Only send enable_thinking when explicitly configured in settings.
-    // Local servers (llama.cpp, vLLM) typically don't support this parameter
-    // and will ignore it, causing the model to dump thinking into regular content.
-    // The DashScope cloud API supports it natively.
+    // Send enable_thinking when:
+    // 1. Explicitly configured in settings (takes priority), OR
+    // 2. The model natively supports thinking and the request allows it.
+    // Qwen 3.5+ models require enable_thinking=true for proper tool calling
+    // behavior in thinking mode — without it the model may dump reasoning
+    // into the content field and fail to emit tool_calls.
     let explicit_thinking = settings_model.and_then(|m| m.enable_thinking);
+    let should_enable_thinking = match explicit_thinking {
+        Some(value) => value && request.thinking_allowed,
+        None => model.supports_thinking() && request.thinking_allowed,
+    };
 
     let thinking_budget = settings_model.and_then(|m| m.thinking_budget);
     let max_completion_tokens = settings_model.and_then(|m| m.max_completion_tokens);
 
     let parallel_tool_calls = settings_model.map(|m| m.capabilities.parallel_tool_calls);
 
-    qwen::Request {
+    let qwen_request = qwen::Request {
         model: model.id().to_string(),
         messages,
         stream: true,
@@ -508,17 +516,72 @@ pub fn into_qwen(
         stream_options: Some(qwen::StreamOptions {
             include_usage: true,
         }),
-        enable_thinking: if explicit_thinking == Some(true) && request.thinking_allowed {
+        enable_thinking: if should_enable_thinking {
             Some(true)
         } else {
             None
         },
-        thinking_budget: if explicit_thinking == Some(true) && request.thinking_allowed {
+        thinking_budget: if should_enable_thinking {
             thinking_budget
         } else {
             None
         },
+    };
+
+    log::info!(
+        "Qwen request: model={}, messages={}, tools={}, enable_thinking={:?}, \
+         thinking_budget={:?}, max_tokens={:?}, max_completion_tokens={:?}, \
+         tool_choice={:?}",
+        qwen_request.model,
+        qwen_request.messages.len(),
+        qwen_request.tools.len(),
+        qwen_request.enable_thinking,
+        qwen_request.thinking_budget,
+        qwen_request.max_tokens,
+        qwen_request.max_completion_tokens,
+        qwen_request.tool_choice,
+    );
+
+    for (i, msg) in qwen_request.messages.iter().enumerate() {
+        match msg {
+            qwen::RequestMessage::System { .. } => {
+                log::debug!("  msg[{}]: system", i);
+            }
+            qwen::RequestMessage::User { content } => {
+                log::debug!(
+                    "  msg[{}]: user, content_len={}",
+                    i,
+                    content.len()
+                );
+            }
+            qwen::RequestMessage::Assistant {
+                content,
+                tool_calls,
+                reasoning_content,
+            } => {
+                log::debug!(
+                    "  msg[{}]: assistant, content={:?}, tool_calls={}, has_reasoning={}",
+                    i,
+                    content.as_ref().map(|c| c.len()),
+                    tool_calls.len(),
+                    reasoning_content.is_some(),
+                );
+            }
+            qwen::RequestMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                log::debug!(
+                    "  msg[{}]: tool, call_id={}, content_len={}",
+                    i,
+                    tool_call_id,
+                    content.len()
+                );
+            }
+        }
     }
+
+    qwen_request
 }
 
 pub struct QwenEventMapper {
@@ -553,6 +616,65 @@ impl QwenEventMapper {
     ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
         let mut events = Vec::new();
 
+        if event.choices.is_empty() {
+            log::debug!("Qwen chunk: empty choices (usage-only)");
+        }
+
+        for (i, choice) in event.choices.iter().enumerate() {
+            let has_delta = choice.delta.is_some();
+            let has_content = choice
+                .delta
+                .as_ref()
+                .and_then(|d| d.content.as_ref())
+                .map_or(false, |c| !c.is_empty());
+            let has_tool_calls = choice
+                .delta
+                .as_ref()
+                .and_then(|d| d.tool_calls.as_ref())
+                .is_some();
+            let has_reasoning = choice
+                .delta
+                .as_ref()
+                .and_then(|d| d.reasoning_content.as_ref())
+                .map_or(false, |r| !r.is_empty());
+
+            if has_content || has_tool_calls || has_reasoning || choice.finish_reason.is_some() {
+                log::info!(
+                    "Qwen chunk[{}]: finish_reason={:?}, delta={}, content={}, \
+                     tool_calls={}, reasoning={}, accumulated_tools={}",
+                    i,
+                    choice.finish_reason,
+                    has_delta,
+                    has_content,
+                    has_tool_calls,
+                    has_reasoning,
+                    self.tool_calls_by_index.len(),
+                );
+            }
+
+            if has_tool_calls {
+                if let Some(tool_calls) = choice.delta.as_ref().and_then(|d| d.tool_calls.as_ref())
+                {
+                    for tc in tool_calls {
+                        log::info!(
+                            "Qwen tool_call chunk: index={}, id={:?}, fn_name={:?}, fn_args={:?}",
+                            tc.index,
+                            tc.id,
+                            tc.function.as_ref().and_then(|f| f.name.as_ref()),
+                            tc.function
+                                .as_ref()
+                                .and_then(|f| f.arguments.as_ref())
+                                .map(|a| if a.len() > 100 {
+                                    format!("{}...", &a[..100])
+                                } else {
+                                    a.clone()
+                                }),
+                        );
+                    }
+                }
+            }
+        }
+
         // When stream_options.include_usage is true, the final chunk has
         // an empty choices array and only contains usage data.
         if event.choices.is_empty() {
@@ -569,8 +691,6 @@ impl QwenEventMapper {
 
         let choice = &event.choices[0];
 
-        let mut events = Vec::new();
-
         if !self.sent_start_message {
             self.sent_start_message = true;
             events.push(Ok(LanguageModelCompletionEvent::StartMessage {
@@ -578,53 +698,56 @@ impl QwenEventMapper {
             }));
         }
 
-        if let Some(content) = choice.delta.content.clone()
-            && !content.is_empty()
-        {
-            events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-        }
-
-        if let Some(reasoning_content) = choice.delta.reasoning_content.clone() {
-            if !reasoning_content.is_empty() {
-                events.push(Ok(LanguageModelCompletionEvent::Thinking {
-                    text: reasoning_content,
-                    signature: None,
-                }));
+        if let Some(delta) = choice.delta.as_ref() {
+            if let Some(content) = delta.content.clone()
+                && !content.is_empty()
+            {
+                events.push(Ok(LanguageModelCompletionEvent::Text(content)));
             }
-        }
 
-        if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
-            for tool_call in tool_calls {
-                let entry = self.tool_calls_by_index.entry(tool_call.index).or_default();
-
-                if let Some(tool_id) = tool_call.id.clone() {
-                    entry.id = tool_id;
+            if let Some(reasoning_content) = delta.reasoning_content.clone() {
+                if !reasoning_content.is_empty() {
+                    events.push(Ok(LanguageModelCompletionEvent::Thinking {
+                        text: reasoning_content,
+                        signature: None,
+                    }));
                 }
+            }
 
-                if let Some(function) = tool_call.function.as_ref() {
-                    if let Some(name) = function.name.clone() {
-                        entry.name = name;
+            if let Some(tool_calls) = delta.tool_calls.as_ref() {
+                for tool_call in tool_calls {
+                    let entry =
+                        self.tool_calls_by_index.entry(tool_call.index).or_default();
+
+                    if let Some(tool_id) = tool_call.id.clone() {
+                        entry.id = tool_id;
                     }
 
-                    if let Some(arguments) = function.arguments.clone() {
-                        entry.arguments.push_str(&arguments);
-                    }
-                }
+                    if let Some(function) = tool_call.function.as_ref() {
+                        if let Some(name) = function.name.clone() {
+                            entry.name = name;
+                        }
 
-                if !entry.id.is_empty() && !entry.name.is_empty() {
-                    if let Ok(input) = serde_json::from_str::<serde_json::Value>(
-                        &fix_streamed_json(&entry.arguments),
-                    ) {
-                        events.push(Ok(LanguageModelCompletionEvent::ToolUse(
-                            LanguageModelToolUse {
-                                id: entry.id.clone().into(),
-                                name: entry.name.as_str().into(),
-                                is_input_complete: false,
-                                input,
-                                raw_input: entry.arguments.clone(),
-                                thought_signature: None,
-                            },
-                        )));
+                        if let Some(arguments) = function.arguments.clone() {
+                            entry.arguments.push_str(&arguments);
+                        }
+                    }
+
+                    if !entry.id.is_empty() && !entry.name.is_empty() {
+                        if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                            &fix_streamed_json(&entry.arguments),
+                        ) {
+                            events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                                LanguageModelToolUse {
+                                    id: entry.id.clone().into(),
+                                    name: entry.name.as_str().into(),
+                                    is_input_complete: false,
+                                    input,
+                                    raw_input: entry.arguments.clone(),
+                                    thought_signature: None,
+                                },
+                            )));
+                        }
                     }
                 }
             }
@@ -641,9 +764,44 @@ impl QwenEventMapper {
 
         match choice.finish_reason.as_deref() {
             Some("stop") => {
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                if self.tool_calls_by_index.is_empty() {
+                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                } else {
+                    log::info!(
+                        "Qwen finish_reason is 'stop' but {} tool call(s) were streamed; \
+                         finalizing them (server likely uses 'stop' instead of 'tool_calls')",
+                        self.tool_calls_by_index.len()
+                    );
+                    events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
+                        match parse_tool_arguments(&tool_call.arguments) {
+                            Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
+                                LanguageModelToolUse {
+                                    id: tool_call.id.clone().into(),
+                                    name: tool_call.name.as_str().into(),
+                                    is_input_complete: true,
+                                    input,
+                                    raw_input: tool_call.arguments.clone(),
+                                    thought_signature: None,
+                                },
+                            )),
+                            Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
+                                id: tool_call.id.clone().into(),
+                                tool_name: tool_call.name.as_str().into(),
+                                raw_input: tool_call.arguments.into(),
+                                json_parse_error: error.to_string(),
+                            }),
+                        }
+                    }));
+                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
+                }
             }
             Some("length") => {
+                if !self.tool_calls_by_index.is_empty() {
+                    log::warn!(
+                        "Qwen finish_reason is 'length' but {} tool call(s) were being streamed and will be dropped",
+                        self.tool_calls_by_index.len()
+                    );
+                }
                 events.push(Ok(LanguageModelCompletionEvent::Stop(
                     StopReason::MaxTokens,
                 )));
@@ -677,6 +835,37 @@ impl QwenEventMapper {
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             None => {}
+        }
+
+        if !events.is_empty() {
+            let event_summary: Vec<&str> = events
+                .iter()
+                .filter_map(|e| e.as_ref().ok())
+                .map(|e| match e {
+                    LanguageModelCompletionEvent::StartMessage { .. } => "StartMessage",
+                    LanguageModelCompletionEvent::Text(_) => "Text",
+                    LanguageModelCompletionEvent::Thinking { .. } => "Thinking",
+                    LanguageModelCompletionEvent::ToolUse(t) => {
+                        if t.is_input_complete {
+                            "ToolUse(complete)"
+                        } else {
+                            "ToolUse(partial)"
+                        }
+                    }
+                    LanguageModelCompletionEvent::ToolUseJsonParseError { .. } => {
+                        "ToolUseJsonParseError"
+                    }
+                    LanguageModelCompletionEvent::Stop(reason) => match reason {
+                        StopReason::EndTurn => "Stop(EndTurn)",
+                        StopReason::ToolUse => "Stop(ToolUse)",
+                        StopReason::MaxTokens => "Stop(MaxTokens)",
+                        StopReason::Refusal => "Stop(Refusal)",
+                    },
+                    LanguageModelCompletionEvent::UsageUpdate(_) => "UsageUpdate",
+                    _ => "Other",
+                })
+                .collect();
+            log::debug!("Qwen map_event produced: {:?}", event_summary);
         }
 
         events
