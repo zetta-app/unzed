@@ -231,6 +231,16 @@ pub struct AgentSettingsContent {
     /// `always_confirm`) match against the tool's text input (command, path,
     /// URL, etc.).
     pub tool_permissions: Option<ToolPermissionsContent>,
+    /// Whether to automatically compact the conversation context when the
+    /// token limit is approaching. When enabled, older messages are summarized
+    /// and replaced to free up token budget, allowing the conversation to
+    /// continue in the same thread.
+    ///
+    /// Can be set to `true`/`false` as a shorthand for enabling/disabling
+    /// with defaults, or configured as an object for fine-grained control.
+    ///
+    /// Default: enabled with "summarize" method
+    pub context_compact: Option<ContextCompactContent>,
 }
 
 impl AgentSettingsContent {
@@ -695,6 +705,134 @@ impl std::fmt::Display for ToolPermissionMode {
             ToolPermissionMode::Confirm => write!(f, "Confirm"),
         }
     }
+}
+
+/// Context compaction strategy for managing conversation token usage.
+///
+/// Accepts either a boolean shorthand (`true`/`false`) or an object with
+/// fine-grained options.
+///
+/// Examples:
+/// ```json
+/// "context_compact": true
+/// "context_compact": false
+/// "context_compact": { "method": "summarize", "threshold": 0.8 }
+/// ```
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema, MergeFrom)]
+#[serde(untagged)]
+pub enum ContextCompactContent {
+    /// Shorthand: `true` enables with defaults, `false` disables.
+    Enabled(bool),
+    /// Full configuration object.
+    Config(ContextCompactConfig),
+}
+
+impl Default for ContextCompactContent {
+    fn default() -> Self {
+        Self::Enabled(true)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextCompactContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            serde_json::Value::Bool(b) => Ok(ContextCompactContent::Enabled(*b)),
+            serde_json::Value::Object(_) => {
+                let config = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(ContextCompactContent::Config(config))
+            }
+            _ => Err(serde::de::Error::custom(
+                "expected boolean or object for context_compact",
+            )),
+        }
+    }
+}
+
+impl ContextCompactContent {
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::Enabled(enabled) => *enabled,
+            Self::Config(config) => config.enabled.unwrap_or(true),
+        }
+    }
+
+    pub fn config(&self) -> ContextCompactConfig {
+        match self {
+            Self::Enabled(true) => ContextCompactConfig::default(),
+            Self::Enabled(false) => ContextCompactConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            Self::Config(config) => config.clone(),
+        }
+    }
+}
+
+/// Detailed configuration for context compaction.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ContextCompactConfig {
+    /// Whether context compaction is enabled.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+
+    /// The compaction method to use.
+    ///
+    /// Default: "summarize"
+    pub method: Option<ContextCompactMethod>,
+
+    /// Context usage ratio (0.0–1.0) at which compaction triggers automatically.
+    /// For example, 0.8 means compaction starts when 80% of the token budget
+    /// is consumed.
+    ///
+    /// Default: 0.8
+    pub threshold: Option<f32>,
+
+    /// Number of recent user–assistant message pairs to always keep intact
+    /// (never compacted). Higher values preserve more recent context at the
+    /// cost of less aggressive compaction.
+    ///
+    /// Default: 1
+    pub preserve_recent_messages: Option<usize>,
+
+    /// Model to use for summarization-based compaction. When unset, falls back
+    /// to the thread summary model, then the default model.
+    pub model: Option<crate::LanguageModelSelection>,
+
+    /// Optional custom instructions appended to the compaction prompt.
+    /// Use this to tell the summarizer what to focus on or preserve.
+    /// For example: "Focus on code samples and API usage" or
+    /// "Always preserve file paths and line numbers verbatim".
+    pub custom_prompt: Option<String>,
+}
+
+/// The compaction method determines how older context is compressed.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactMethod {
+    /// LLM-based summarization: an LLM rewrites older messages into a
+    /// structured summary covering completed work, current state, and
+    /// pending tasks. Achieves 70–90% compression but may paraphrase
+    /// exact details like file paths or line numbers.
+    #[default]
+    Summarize,
+
+    /// Tool-output masking: replaces tool call outputs (file reads, grep
+    /// results, terminal output) with short placeholders after the model
+    /// has already processed them. Zero LLM cost, but the raw data is
+    /// gone if the model needs to re-reference it.
+    MaskToolOutputs,
+
+    /// Hybrid approach: first masks tool outputs, then summarizes the
+    /// remaining conversation if it still exceeds the threshold. Combines
+    /// the low cost of masking with the deeper compression of summarization.
+    HybridMaskThenSummarize,
 }
 
 #[cfg(test)]

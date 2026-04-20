@@ -174,6 +174,14 @@ pub enum AgentThreadEntry {
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
     CompletedPlan(Vec<PlanEntry>),
+    /// A compaction summary shown after context was compacted.
+    CompactionSummary(CompactionSummaryEntry),
+}
+
+/// A visible entry showing the compacted context summary.
+#[derive(Debug)]
+pub struct CompactionSummaryEntry {
+    pub block: ContentBlock,
 }
 
 impl AgentThreadEntry {
@@ -183,6 +191,7 @@ impl AgentThreadEntry {
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
             Self::CompletedPlan(_) => false,
+            Self::CompactionSummary(_) => false,
         }
     }
 
@@ -198,6 +207,12 @@ impl AgentThreadEntry {
                     md.push_str(&format!("- [x] {}\n", source));
                 }
                 md
+            }
+            Self::CompactionSummary(entry) => {
+                format!(
+                    "## Context Compacted\n\n{}\n\n",
+                    entry.block.to_markdown(cx)
+                )
             }
         }
     }
@@ -1078,14 +1093,59 @@ struct StreamingTextBuffer {
     target: Entity<Markdown>,
     /// Timer task that periodically moves text from `pending` into `source`.
     _reveal_task: Task<()>,
+    /// Exponential moving average of incoming bytes per second, used to adapt
+    /// the reveal interval to model throughput.
+    throughput_bytes_per_sec: f32,
+    /// When the last chunk was received, for throughput measurement.
+    last_chunk_received: Instant,
 }
 
 impl StreamingTextBuffer {
-    /// The number of milliseconds between each timer tick, controlling how quickly
-    /// text is revealed.
-    const TASK_UPDATE_MS: u64 = 16;
-    /// The time in milliseconds to reveal the entire pending text.
+    /// Minimum tick interval — used when throughput is low so text appears
+    /// promptly without a perceptible delay.
+    const MIN_TICK_MS: u64 = 16;
+    /// Maximum tick interval — used when throughput is high to batch more text
+    /// per redraw and reduce markdown re-parse / layout cost.
+    const MAX_TICK_MS: u64 = 80;
+    /// Throughput (bytes/sec) at or below which we use `MIN_TICK_MS`.
+    const LOW_THROUGHPUT: f32 = 200.0;
+    /// Throughput (bytes/sec) at or above which we use `MAX_TICK_MS`.
+    const HIGH_THROUGHPUT: f32 = 4000.0;
+    /// Smoothing factor for the exponential moving average (0..1).
+    /// Higher values make the estimate react faster to changes.
+    const EMA_ALPHA: f32 = 0.3;
+    /// The time in milliseconds over which to spread revealing the current
+    /// pending text, keeping the animation smooth.
     const REVEAL_TARGET: f32 = 200.0;
+
+    /// Returns the adaptive tick interval in milliseconds based on the current
+    /// throughput estimate. Linearly interpolates between `MIN_TICK_MS` and
+    /// `MAX_TICK_MS` over the throughput range.
+    fn tick_interval_ms(&self) -> u64 {
+        let ratio = ((self.throughput_bytes_per_sec - Self::LOW_THROUGHPUT)
+            / (Self::HIGH_THROUGHPUT - Self::LOW_THROUGHPUT))
+            .clamp(0.0, 1.0);
+        let ms = Self::MIN_TICK_MS as f32
+            + ratio * (Self::MAX_TICK_MS as f32 - Self::MIN_TICK_MS as f32);
+        ms as u64
+    }
+
+    /// Update the throughput estimate with a new chunk of `byte_count` bytes.
+    fn record_chunk(&mut self, byte_count: usize) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_chunk_received);
+        self.last_chunk_received = now;
+
+        let elapsed_secs = elapsed.as_secs_f32().max(0.001);
+        let instantaneous = byte_count as f32 / elapsed_secs;
+
+        if self.throughput_bytes_per_sec == 0.0 {
+            self.throughput_bytes_per_sec = instantaneous;
+        } else {
+            self.throughput_bytes_per_sec = Self::EMA_ALPHA * instantaneous
+                + (1.0 - Self::EMA_ALPHA) * self.throughput_bytes_per_sec;
+        }
+    }
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {
@@ -1357,7 +1417,8 @@ impl AcpThread {
                 }) => return true,
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
         false
@@ -1385,7 +1446,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
 
@@ -1404,7 +1466,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
 
@@ -1415,7 +1478,9 @@ impl AcpThread {
         for entry in self.entries.iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(..) => return false,
-                AgentThreadEntry::AssistantMessage(..) | AgentThreadEntry::CompletedPlan(..) => {
+                AgentThreadEntry::AssistantMessage(..)
+                | AgentThreadEntry::CompletedPlan(..)
+                | AgentThreadEntry::CompactionSummary(..) => {
                     continue;
                 }
                 AgentThreadEntry::ToolCall(..) => return true,
@@ -1574,10 +1639,11 @@ impl AcpThread {
 
         // For text chunks going to an existing Markdown block, buffer for smooth
         // streaming instead of appending all at once which may feel more choppy.
+        // We skip emitting EntryUpdated here because the text is only buffered,
+        // not yet appended to the Markdown entity. The reveal timer in
+        // `start_streaming_reveal` will update the Markdown and notify the UI.
         if let acp::ContentBlock::Text(text_content) = &chunk {
             if let Some(markdown) = self.streaming_markdown_target(is_thought, indented) {
-                let entries_len = self.entries.len();
-                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
                 self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
                 return;
             }
@@ -1671,13 +1737,17 @@ impl AcpThread {
         text: String,
         cx: &mut Context<Self>,
     ) {
+        let text_len = text.len();
+
         if let Some(buffer) = &mut self.streaming_text_buffer {
             if buffer.target.entity_id() == markdown.entity_id() {
                 buffer.pending.push_str(&text);
+                buffer.record_chunk(text_len);
 
+                let tick_ms = buffer.tick_interval_ms() as f32;
                 buffer.bytes_to_reveal_per_tick = (buffer.pending.len() as f32
                     / StreamingTextBuffer::REVEAL_TARGET
-                    * StreamingTextBuffer::TASK_UPDATE_MS as f32)
+                    * tick_ms)
                     .ceil() as usize;
                 return;
             }
@@ -1687,14 +1757,16 @@ impl AcpThread {
         let target = markdown.clone();
         let _reveal_task = self.start_streaming_reveal(cx);
         let pending_len = text.len();
-        let bytes_to_reveal = (pending_len as f32 / StreamingTextBuffer::REVEAL_TARGET
-            * StreamingTextBuffer::TASK_UPDATE_MS as f32)
+        let tick_ms = StreamingTextBuffer::MIN_TICK_MS as f32;
+        let bytes_to_reveal = (pending_len as f32 / StreamingTextBuffer::REVEAL_TARGET * tick_ms)
             .ceil() as usize;
         self.streaming_text_buffer = Some(StreamingTextBuffer {
             pending: text,
             bytes_to_reveal_per_tick: bytes_to_reveal,
             target,
             _reveal_task,
+            throughput_bytes_per_sec: 0.0,
+            last_chunk_received: Instant::now(),
         });
     }
 
@@ -1714,12 +1786,22 @@ impl AcpThread {
 
     /// Spawns a foreground task that periodically drains
     /// `streaming_text_buffer.pending` into the target `Markdown` entity,
-    /// producing smooth, continuous text output.
+    /// producing smooth, continuous text output. The tick interval adapts to
+    /// model throughput — shorter when the model is slow, longer when fast.
     fn start_streaming_reveal(&self, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
+                let tick_ms = this
+                    .update(cx, |this, _cx| {
+                        this.streaming_text_buffer
+                            .as_ref()
+                            .map(|buffer| buffer.tick_interval_ms())
+                            .unwrap_or(StreamingTextBuffer::MIN_TICK_MS)
+                    })
+                    .unwrap_or(StreamingTextBuffer::MIN_TICK_MS);
+
                 cx.background_executor()
-                    .timer(Duration::from_millis(StreamingTextBuffer::TASK_UPDATE_MS))
+                    .timer(Duration::from_millis(tick_ms))
                     .await;
 
                 let should_continue = this
@@ -1744,6 +1826,11 @@ impl AcpThread {
                             buffer.pending.drain(..byte_boundary);
                         });
 
+                        let entries_len = this.entries.len();
+                        if entries_len > 0 {
+                            cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
+                        }
+
                         true
                     })
                     .unwrap_or(false);
@@ -1759,6 +1846,22 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
+    }
+
+    /// Adds a compaction summary as a visible entry in the thread.
+    pub fn push_compaction_summary(&mut self, summary: &str, cx: &mut Context<Self>) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let block = ContentBlock::new(
+            acp::ContentBlock::Text(acp::TextContent::new(summary)),
+            &language_registry,
+            path_style,
+            cx,
+        );
+        self.push_entry(
+            AgentThreadEntry::CompactionSummary(CompactionSummaryEntry { block }),
+            cx,
+        );
     }
 
     pub fn can_set_title(&mut self, cx: &mut Context<Self>) -> bool {

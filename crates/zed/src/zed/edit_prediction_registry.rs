@@ -112,7 +112,8 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
         EditPredictionProvider::None => None,
         EditPredictionProvider::Copilot => Some(EditPredictionProviderConfig::Copilot),
         EditPredictionProvider::Zed => {
-            Some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
+            // Zed AI cloud provider removed for privacy
+            None
         }
         EditPredictionProvider::Codestral => Some(EditPredictionProviderConfig::Codestral),
         EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi => {
@@ -144,9 +145,10 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
             }
         }
 
-        EditPredictionProvider::Mercury => Some(EditPredictionProviderConfig::Zed(
-            EditPredictionModel::Mercury,
-        )),
+        EditPredictionProvider::Mercury => {
+            // Mercury cloud provider removed for privacy
+            None
+        }
         EditPredictionProvider::Experimental(_) => None,
     }
 }

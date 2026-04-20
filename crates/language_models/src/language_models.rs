@@ -8,29 +8,45 @@ use gpui::{App, Context, Entity};
 use language_model::{
     ConfiguredModel, LanguageModelProviderId, LanguageModelRegistry, ZED_CLOUD_PROVIDER_ID,
 };
-use provider::deepseek::DeepSeekLanguageModelProvider;
+
+#[cfg(feature = "anthropic")]
+use crate::provider::anthropic::AnthropicLanguageModelProvider;
+#[cfg(feature = "bedrock")]
+use crate::provider::bedrock::BedrockLanguageModelProvider;
+#[cfg(feature = "cloud")]
+use crate::provider::cloud::CloudLanguageModelProvider;
+#[cfg(feature = "copilot_chat")]
+use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
+#[cfg(feature = "deepseek")]
+use crate::provider::deepseek::DeepSeekLanguageModelProvider;
+#[cfg(feature = "google")]
+use crate::provider::google::GoogleLanguageModelProvider;
+#[cfg(feature = "lmstudio")]
+use crate::provider::lmstudio::LmStudioLanguageModelProvider;
+#[cfg(feature = "mistral")]
+pub use crate::provider::mistral::MistralLanguageModelProvider;
+#[cfg(feature = "ollama")]
+use crate::provider::ollama::OllamaLanguageModelProvider;
+#[cfg(feature = "open_ai")]
+use crate::provider::open_ai::OpenAiLanguageModelProvider;
+use crate::provider::open_ai_compatible::OpenAiCompatibleLanguageModelProvider;
+#[cfg(feature = "open_router")]
+use crate::provider::open_router::OpenRouterLanguageModelProvider;
+#[cfg(feature = "opencode")]
+use crate::provider::opencode::OpenCodeLanguageModelProvider;
+use crate::provider::qwen::QwenLanguageModelProvider;
+#[cfg(feature = "vercel")]
+use crate::provider::vercel::VercelLanguageModelProvider;
+#[cfg(feature = "vercel_ai_gateway")]
+use crate::provider::vercel_ai_gateway::VercelAiGatewayLanguageModelProvider;
+#[cfg(feature = "x_ai")]
+use crate::provider::x_ai::XAiLanguageModelProvider;
 
 pub mod extension;
 pub mod provider;
 mod settings;
 
 pub use crate::extension::init_proxy as init_extension_proxy;
-
-use crate::provider::anthropic::AnthropicLanguageModelProvider;
-use crate::provider::bedrock::BedrockLanguageModelProvider;
-use crate::provider::cloud::CloudLanguageModelProvider;
-use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
-use crate::provider::google::GoogleLanguageModelProvider;
-use crate::provider::lmstudio::LmStudioLanguageModelProvider;
-pub use crate::provider::mistral::MistralLanguageModelProvider;
-use crate::provider::ollama::OllamaLanguageModelProvider;
-use crate::provider::open_ai::OpenAiLanguageModelProvider;
-use crate::provider::open_ai_compatible::OpenAiCompatibleLanguageModelProvider;
-use crate::provider::open_router::OpenRouterLanguageModelProvider;
-use crate::provider::opencode::OpenCodeLanguageModelProvider;
-use crate::provider::vercel::VercelLanguageModelProvider;
-use crate::provider::vercel_ai_gateway::VercelAiGatewayLanguageModelProvider;
-use crate::provider::x_ai::XAiLanguageModelProvider;
 pub use crate::settings::*;
 
 pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
@@ -239,6 +255,7 @@ fn register_language_model_providers(
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &mut Context<LanguageModelRegistry>,
 ) {
+    #[cfg(feature = "cloud")]
     registry.register_provider(
         Arc::new(CloudLanguageModelProvider::new(
             user_store,
@@ -247,6 +264,10 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(not(feature = "cloud"))]
+    let _ = user_store;
+
+    #[cfg(feature = "anthropic")]
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
             client.http_client(),
@@ -255,6 +276,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "open_ai")]
     registry.register_provider(
         Arc::new(OpenAiLanguageModelProvider::new(
             client.http_client(),
@@ -263,6 +285,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "ollama")]
     registry.register_provider(
         Arc::new(OllamaLanguageModelProvider::new(
             client.http_client(),
@@ -271,6 +294,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "lmstudio")]
     registry.register_provider(
         Arc::new(LmStudioLanguageModelProvider::new(
             client.http_client(),
@@ -279,6 +303,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "deepseek")]
     registry.register_provider(
         Arc::new(DeepSeekLanguageModelProvider::new(
             client.http_client(),
@@ -287,6 +312,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "google")]
     registry.register_provider(
         Arc::new(GoogleLanguageModelProvider::new(
             client.http_client(),
@@ -295,6 +321,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "mistral")]
     registry.register_provider(
         MistralLanguageModelProvider::global(
             client.http_client(),
@@ -303,6 +330,7 @@ fn register_language_model_providers(
         ),
         cx,
     );
+    #[cfg(feature = "bedrock")]
     registry.register_provider(
         Arc::new(BedrockLanguageModelProvider::new(
             client.http_client(),
@@ -311,6 +339,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "open_router")]
     registry.register_provider(
         Arc::new(OpenRouterLanguageModelProvider::new(
             client.http_client(),
@@ -319,6 +348,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "vercel")]
     registry.register_provider(
         Arc::new(VercelLanguageModelProvider::new(
             client.http_client(),
@@ -327,6 +357,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "vercel_ai_gateway")]
     registry.register_provider(
         Arc::new(VercelAiGatewayLanguageModelProvider::new(
             client.http_client(),
@@ -335,6 +366,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "x_ai")]
     registry.register_provider(
         Arc::new(XAiLanguageModelProvider::new(
             client.http_client(),
@@ -343,13 +375,23 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    #[cfg(feature = "opencode")]
     registry.register_provider(
         Arc::new(OpenCodeLanguageModelProvider::new(
             client.http_client(),
-            credentials_provider,
+            credentials_provider.clone(),
             cx,
         )),
         cx,
     );
+    registry.register_provider(
+        Arc::new(QwenLanguageModelProvider::new(
+            client.http_client(),
+            credentials_provider.clone(),
+            cx,
+        )),
+        cx,
+    );
+    #[cfg(feature = "copilot_chat")]
     registry.register_provider(Arc::new(CopilotChatLanguageModelProvider::new(cx)), cx);
 }

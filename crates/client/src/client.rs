@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
@@ -56,7 +58,6 @@ use util::{ConnectionResult, ResultExt};
 
 pub use llm_token::*;
 pub use rpc::*;
-pub use telemetry_events::Event;
 pub use user::*;
 
 static ZED_SERVER_URL: LazyLock<Option<String>> =
@@ -970,89 +971,20 @@ impl Client {
     /// Only Zed staff automatically connect to Collab.
     pub async fn sign_in_with_optional_connect(
         self: &Arc<Self>,
-        try_provider: bool,
-        cx: &AsyncApp,
+        _try_provider: bool,
+        _cx: &AsyncApp,
     ) -> Result<()> {
-        // Don't try to sign in again if we're already connected to Collab, as it will temporarily disconnect us.
-        if self.status().borrow().is_connected() {
-            return Ok(());
-        }
-
-        let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
-        let mut is_staff_tx = Some(is_staff_tx);
-        cx.update(|cx| {
-            cx.on_flags_ready(move |state, _cx| {
-                if let Some(is_staff_tx) = is_staff_tx.take() {
-                    is_staff_tx.send(state.is_staff).log_err();
-                }
-            })
-            .detach();
-        });
-
-        let credentials = self.sign_in(try_provider, cx).await?;
-
-        self.connect_to_cloud(cx).await.log_err();
-
-        cx.update(move |cx| {
-            cx.spawn({
-                let client = self.clone();
-                async move |cx| {
-                    let is_staff = is_staff_rx.await?;
-                    if is_staff {
-                        match client.connect_with_credentials(credentials, cx).await {
-                            ConnectionResult::Timeout => Err(anyhow!("connection timed out")),
-                            ConnectionResult::ConnectionReset => Err(anyhow!("connection reset")),
-                            ConnectionResult::Result(result) => {
-                                result.context("client auth and connect")
-                            }
-                        }
-                    } else {
-                        Ok(())
-                    }
-                }
-            })
-            .detach_and_log_err(cx);
-        });
-
+        // Collab disabled for privacy — no connections to zed.dev
         Ok(())
     }
 
     pub async fn connect(
         self: &Arc<Self>,
-        try_provider: bool,
-        cx: &AsyncApp,
+        _try_provider: bool,
+        _cx: &AsyncApp,
     ) -> ConnectionResult<()> {
-        let was_disconnected = match *self.status().borrow() {
-            Status::SignedOut | Status::Authenticated => true,
-            Status::ConnectionError
-            | Status::ConnectionLost
-            | Status::Authenticating
-            | Status::AuthenticationError
-            | Status::Reauthenticating
-            | Status::Reauthenticated
-            | Status::ReconnectionError { .. } => false,
-            Status::Connected { .. } | Status::Connecting | Status::Reconnecting => {
-                return ConnectionResult::Result(Ok(()));
-            }
-            Status::UpgradeRequired => {
-                return ConnectionResult::Result(
-                    Err(EstablishConnectionError::UpgradeRequired)
-                        .context("client auth and connect"),
-                );
-            }
-        };
-        let credentials = match self.sign_in(try_provider, cx).await {
-            Ok(credentials) => credentials,
-            Err(err) => return ConnectionResult::Result(Err(err)),
-        };
-
-        if was_disconnected {
-            self.set_status(Status::Connecting, cx);
-        } else {
-            self.set_status(Status::Reconnecting, cx);
-        }
-
-        self.connect_with_credentials(credentials, cx).await
+        // Collab disabled for privacy
+        ConnectionResult::Result(Ok(()))
     }
 
     async fn connect_with_credentials(
@@ -1265,8 +1197,6 @@ impl Client {
         let user_agent = http.user_agent().cloned();
         let credentials = credentials.clone();
         let rpc_url = self.rpc_url(http, release_channel);
-        let system_id = self.telemetry.system_id();
-        let metrics_id = self.telemetry.metrics_id();
         cx.spawn(async move |cx| {
             use HttpOrHttps::*;
 
@@ -1330,12 +1260,6 @@ impl Client {
             );
             if let Some(user_agent) = user_agent {
                 request_headers.insert(http::header::USER_AGENT, user_agent);
-            }
-            if let Some(system_id) = system_id {
-                request_headers.insert("x-zed-system-id", HeaderValue::from_str(&system_id)?);
-            }
-            if let Some(metrics_id) = metrics_id {
-                request_headers.insert("x-zed-metrics-id", HeaderValue::from_str(&metrics_id)?);
             }
 
             let (stream, _) = async_tungstenite::tokio::client_async_tls_with_connector_and_config(
@@ -1526,10 +1450,9 @@ impl Client {
         llm_token: &LlmApiToken,
         organization_id: Option<OrganizationId>,
     ) -> Result<String> {
-        let system_id = self.telemetry().system_id().map(|x| x.to_string());
         let cloud_client = self.cloud_client();
         match llm_token
-            .acquire(&cloud_client, system_id, organization_id)
+            .acquire(&cloud_client, None, organization_id)
             .await
         {
             Ok(token) => Ok(token),
@@ -1546,10 +1469,9 @@ impl Client {
         llm_token: &LlmApiToken,
         organization_id: Option<OrganizationId>,
     ) -> Result<String> {
-        let system_id = self.telemetry().system_id().map(|x| x.to_string());
         let cloud_client = self.cloud_client();
         match llm_token
-            .refresh(&cloud_client, system_id, organization_id)
+            .refresh(&cloud_client, None, organization_id)
             .await
         {
             Ok(token) => Ok(token),
@@ -1566,10 +1488,9 @@ impl Client {
         llm_token: &LlmApiToken,
         organization_id: Option<OrganizationId>,
     ) -> Result<String> {
-        let system_id = self.telemetry().system_id().map(|x| x.to_string());
         let cloud_client = self.cloud_client();
         match llm_token
-            .clear_and_refresh(&cloud_client, system_id, organization_id)
+            .clear_and_refresh(&cloud_client, None, organization_id)
             .await
         {
             Ok(token) => Ok(token),

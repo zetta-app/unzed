@@ -464,6 +464,13 @@ pub async fn stream_completion(
         let reader = BufReader::new(response.into_body());
         Ok(reader
             .lines()
+            .take_while(|line| {
+                let is_done = match line {
+                    Ok(line) => line.starts_with("data: [DONE]"),
+                    Err(_) => false,
+                };
+                async move { !is_done }
+            })
             .filter_map(|line| async move {
                 match line {
                     Ok(line) => {
@@ -472,17 +479,13 @@ pub async fn stream_completion(
                         }
 
                         let line = line.strip_prefix("data: ")?;
-                        if line == "[DONE]" {
-                            None
-                        } else {
-                            match serde_json::from_str::<ResponseStreamEvent>(line) {
-                                Ok(response) => Some(Ok(response)),
-                                Err(error) => {
-                                    if line.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(Err(OpenRouterError::DeserializeResponse(error)))
-                                    }
+                        match serde_json::from_str::<ResponseStreamEvent>(line) {
+                            Ok(response) => Some(Ok(response)),
+                            Err(error) => {
+                                if line.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(Err(OpenRouterError::DeserializeResponse(error)))
                                 }
                             }
                         }

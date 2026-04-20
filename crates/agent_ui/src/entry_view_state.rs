@@ -242,6 +242,11 @@ impl EntryViewState {
                     self.set_entry(index, Entry::CompletedPlan);
                 }
             }
+            AgentThreadEntry::CompactionSummary(_) => {
+                if !matches!(self.entries.get(index), Some(Entry::CompletedPlan)) {
+                    self.set_entry(index, Entry::CompletedPlan);
+                }
+            }
         };
     }
 

@@ -486,7 +486,7 @@
     // Whether to show the user menu in the titlebar.
     "show_user_menu": true,
     // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
+    "show_sign_in": false,
     // Whether to show the menus in the titlebar.
     "show_menus": false,
     // The layout of window control buttons in the title bar (Linux only).
@@ -906,7 +906,7 @@
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
-    "button": true,
+    "button": false,
     // Where to dock the collaboration panel. Can be 'left' or 'right'.
     "dock": "right",
     // Default width of the collaboration panel.
@@ -1179,6 +1179,22 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Whether to automatically compact the conversation context when the
+    // token limit is approaching. When enabled, older messages are summarized
+    // and replaced to free up token budget, allowing the conversation to
+    // continue in the same thread.
+    //
+    // Can be set to `true`/`false` as shorthand, or an object for fine-grained control:
+    //   "context_compact": {
+    //     "enabled": true,
+    //     "method": "summarize",       // "summarize", "mask_tool_outputs", or "hybrid_mask_then_summarize"
+    //     "threshold": 0.8,            // context usage ratio (0.0-1.0) to trigger compaction
+    //     "preserve_recent_messages": 1, // number of recent exchanges to keep intact
+    //     "custom_prompt": "Focus on code samples and file paths"
+    //   }
+    //
+    // Default: true
+    "context_compact": true
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,
@@ -1422,9 +1438,9 @@
   // Control what info is collected by Zed.
   "telemetry": {
     // Send debug info like crash reports.
-    "diagnostics": true,
+    "diagnostics": false,
     // Send anonymized usage data like what languages you're using Zed with.
-    "metrics": true,
+    "metrics": false,
   },
   // Whether to disable all AI features in Zed.
   //
@@ -1432,7 +1448,7 @@
   "disable_ai": false,
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
-  "auto_update": true,
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
@@ -1598,7 +1614,7 @@
   "load_direnv": "direct",
   "edit_predictions": {
     // Which edit prediction provider to use.
-    "provider": "zed",
+    "provider": "none",
     // A list of globs representing files that edit predictions should be disabled for.
     // There's a sensible default list of globs already included.
     // Any addition to this list will be merged with the default list.
@@ -2288,6 +2304,9 @@
     },
     "open_router": {
       "api_url": "https://openrouter.ai/api/v1",
+    },
+    "qwen": {
+      "api_url": "http://localhost:8000/v1",
     },
     "lmstudio": {
       "api_url": "http://localhost:1234/api/v0",

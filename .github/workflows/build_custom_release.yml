@@ -1,0 +1,160 @@
+name: Build Custom Release
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: '1'
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub release with the artifacts'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  bundle_linux_x86_64:
+    runs-on: ubuntu-22.04
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+
+      - name: Set build metadata
+        run: |
+          version="$(script/get-crate-version zed)"
+          echo "RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
+          echo "ZED_BUNDLE=true" >> "$GITHUB_ENV"
+
+          version_info=$(rustc --version --verbose)
+          host_line=$(echo "$version_info" | grep host)
+          target_triple=${host_line#*: }
+          echo "TARGET_TRIPLE=${target_triple}" >> "$GITHUB_ENV"
+
+      - name: Generate licenses
+        run: script/generate-licenses
+
+      - name: Build
+        run: |
+          arch=$(uname -m)
+          export RUSTFLAGS="${RUSTFLAGS:-} -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib,-rpath,\$ORIGIN/lib"
+          if [[ "$arch" == "aarch64" ]]; then
+              export RUSTFLAGS="${RUSTFLAGS} -C link-arg=-fuse-ld=lld"
+          fi
+
+          cargo build --release \
+            --target "${TARGET_TRIPLE}" \
+            --package zed \
+            --package cli \
+            --no-default-features \
+            --features provider-open-ai
+
+      - name: Strip and package
+        run: |
+          target_dir="${CARGO_TARGET_DIR:-target}"
+          arch=$(uname -m)
+          dist_dir="dist/release"
+
+          rm -rf "${dist_dir}"
+          mkdir -p "${dist_dir}/lib" "${dist_dir}/bin" "${dist_dir}/share/icons/hicolor/512x512/apps"
+
+          # Binary
+          cp "${target_dir}/${TARGET_TRIPLE}/release/zed" "${dist_dir}/libexec-zed"
+          cp "${target_dir}/${TARGET_TRIPLE}/release/cli" "${dist_dir}/bin/zed"
+
+          # Bundled shared libraries
+          ldd "${target_dir}/${TARGET_TRIPLE}/release/zed" |
+              awk '/=>/ { print $3 }' |
+              grep -v '^\s*$' |
+              grep -v '\(libc\.so\|libm\.so\|libpthread\|libdl\|ld-linux\)' |
+              while read -r lib; do
+                  [ -f "$lib" ] && cp "$lib" "${dist_dir}/lib/"
+              done
+
+          # Strip debug symbols
+          llvm-objcopy --strip-debug "${dist_dir}/libexec-zed"
+          llvm-objcopy --strip-debug "${dist_dir}/bin/zed"
+
+          # Icon
+          channel=$(<crates/zed/RELEASE_CHANNEL)
+          suffix=""
+          if [ "$channel" != "stable" ]; then
+            suffix="-$channel"
+          fi
+          cp "crates/zed/resources/app-icon${suffix}.png" "${dist_dir}/share/icons/hicolor/512x512/apps/zed.png" || true
+
+          # Licenses
+          cp "assets/licenses.md" "${dist_dir}/licenses.md" || true
+
+          # Wrapper script
+          cat > "${dist_dir}/zed-editor" << 'WRAPPER'
+          #!/usr/bin/env bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="${SCRIPT_DIR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "${SCRIPT_DIR}/libexec-zed" "$@"
+          WRAPPER
+          chmod +x "${dist_dir}/zed-editor"
+
+          # Create tarball
+          tar -czvf "${target_dir}/release/zed-custom-linux-${arch}.tar.gz" -C dist release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-custom-linux-x86_64.tar.gz
+          path: target/release/zed-custom-linux-*.tar.gz
+          if-no-files-found: error
+
+  create_release:
+    needs: bundle_linux_x86_64
+    if: inputs.create_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          version="$(script/get-crate-version zed)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: custom-v${{ steps.version.outputs.version }}
+          name: Custom Build v${{ steps.version.outputs.version }}
+          draft: true
+          files: ./artifacts/**/*.tar.gz
+          body: |
+            Custom build with only Qwen and OpenAI-compatible LLM providers.
+
+            Built on Ubuntu 22.04 (glibc 2.35) for broad Linux compatibility.
+
+            ## Installation
+            ```
+            tar xzf zed-custom-linux-x86_64.tar.gz
+            cd release
+            ./zed-editor
+            ```

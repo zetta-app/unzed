@@ -157,6 +157,7 @@ members = [
     "crates/project_symbols",
     "crates/prompt_store",
     "crates/proto",
+    "crates/qwen",
     "crates/recent_projects",
     "crates/refineable",
     "crates/refineable/derive_refineable",
@@ -371,7 +372,7 @@ language_core = { path = "crates/language_core" }
 language_extension = { path = "crates/language_extension" }
 language_model = { path = "crates/language_model" }
 language_model_core = { path = "crates/language_model_core" }
-language_models = { path = "crates/language_models" }
+language_models = { path = "crates/language_models", default-features = false }
 language_models_cloud = { path = "crates/language_models_cloud" }
 language_onboarding = { path = "crates/language_onboarding" }
 language_selector = { path = "crates/language_selector" }
@@ -415,6 +416,7 @@ project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
+qwen = { path = "crates/qwen" }
 recent_projects = { path = "crates/recent_projects" }
 refineable = { path = "crates/refineable" }
 release_channel = { path = "crates/release_channel" }

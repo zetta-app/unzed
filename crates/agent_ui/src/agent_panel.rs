@@ -32,11 +32,11 @@ use zed_actions::{
 use crate::DEFAULT_THREAD_TITLE;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
 use crate::{
-    AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, CreateWorktree,
-    Follow, InlineAssistant, LoadThreadFromClipboard, NewThread, NewWorktreeBranchTarget,
-    OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell, ResetTrialUpsell,
-    SwitchWorktree, ToggleNavigationMenu, ToggleNewThreadMenu, ToggleOptionsMenu,
-    ToggleWorktreeSelector,
+    AddContextServer, AgentDiffPane, CompactContext, ConversationView, CopyThreadToClipboard,
+    CreateWorktree, CycleStartThreadIn, Follow, InlineAssistant, LoadThreadFromClipboard,
+    NewThread, NewWorktreeBranchTarget, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory,
+    ResetTrialEndUpsell, ResetTrialUpsell, StartThreadIn, SwitchWorktree, ToggleNavigationMenu,
+    ToggleNewThreadMenu, ToggleOptionsMenu, ToggleWorktreeSelector, ViewCompactSummary,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     conversation_view::{AcpThreadViewEvent, ThreadView},
     thread_worktree_picker::ThreadWorktreePicker,
@@ -1842,6 +1842,47 @@ impl AgentPanel {
                     .open_thread_as_markdown(workspace, window, cx)
                     .detach_and_log_err(cx);
             });
+        }
+    }
+
+    fn compact_context(
+        &mut self,
+        _: &CompactContext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("AgentPanel::compact_context action handler called");
+        if let Some(thread) = self.active_native_agent_thread(cx) {
+            thread.update(cx, |thread, cx| {
+                log::info!("Calling thread.compact_context_forced()");
+                thread.compact_context_forced(cx);
+            });
+        } else {
+            log::warn!("CompactContext: no active native agent thread");
+        }
+    }
+
+    fn view_compact_summary(
+        &mut self,
+        _: &ViewCompactSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("AgentPanel::view_compact_summary action handler called");
+        if let Some(conversation_view) = self.active_conversation_view()
+            && let Some(active_thread) = conversation_view.read(cx).active_thread().cloned()
+        {
+            active_thread.update(cx, |thread_view, cx| {
+                if let Some(task) =
+                    thread_view.view_compact_summary(&ViewCompactSummary, window, cx)
+                {
+                    task.detach_and_log_err(cx);
+                } else {
+                    log::warn!("View Compact Summary: no summary available or no native thread");
+                }
+            });
+        } else {
+            log::warn!("ViewCompactSummary: no active conversation view or thread");
         }
     }
 
@@ -3973,6 +4014,9 @@ impl AgentPanel {
                             menu = menu.header("Current Thread");
 
                             if let Some(conversation_view) = conversation_view.as_ref() {
+                                let compact_conversation_view = conversation_view.clone();
+                                let summary_conversation_view = conversation_view.clone();
+
                                 menu = menu
                                     .entry("Regenerate Thread Title", None, {
                                         let conversation_view = conversation_view.clone();
@@ -3981,6 +4025,37 @@ impl AgentPanel {
                                                 conversation_view.clone(),
                                                 cx,
                                             );
+                                        }
+                                    })
+                                    .entry("Compact Context", None, {
+                                        move |_, cx| {
+                                            compact_conversation_view.update(cx, |view, cx| {
+                                                if let Some(thread) = view.as_native_thread(cx) {
+                                                    thread.update(cx, |thread, cx| {
+                                                        log::info!("Manually triggering context compaction");
+                                                        thread.compact_context_forced(cx);
+                                                    });
+                                                } else {
+                                                    log::warn!("Compact Context: no native thread available");
+                                                }
+                                            });
+                                        }
+                                    })
+                                    .entry("View Compact Summary", None, {
+                                        move |window, cx| {
+                                            summary_conversation_view.update(cx, |view, cx| {
+                                                if let Some(active_thread) = view.active_thread().cloned() {
+                                                    active_thread.update(cx, |thread_view, cx| {
+                                                        if let Some(task) = thread_view.view_compact_summary(&ViewCompactSummary, window, cx) {
+                                                            task.detach_and_log_err(cx);
+                                                        } else {
+                                                            log::warn!("View Compact Summary: no summary available or no native thread");
+                                                        }
+                                                    });
+                                                } else {
+                                                    log::warn!("View Compact Summary: no active thread");
+                                                }
+                                            });
                                         }
                                     })
                                     .separator();
@@ -4928,6 +5003,8 @@ impl Render for AgentPanel {
                 this.open_configuration(window, cx);
             }))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
+            .on_action(cx.listener(Self::compact_context))
+            .on_action(cx.listener(Self::view_compact_summary))
             .on_action(cx.listener(Self::deploy_rules_library))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::toggle_navigation_menu))

@@ -136,6 +136,10 @@ actions!(
         OpenAgentDiff,
         /// Copies the current thread to the clipboard as JSON for debugging.
         CopyThreadToClipboard,
+        /// Manually triggers context compaction on the active thread.
+        CompactContext,
+        /// Opens the raw compacted context summary for viewing and editing.
+        ViewCompactSummary,
         /// Loads a thread from the clipboard JSON for debugging.
         LoadThreadFromClipboard,
         /// Keeps the current suggestion or change.
@@ -794,6 +798,7 @@ mod tests {
             new_thread_location: Default::default(),
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            context_compact: Default::default(),
         };
 
         cx.update(|cx| {

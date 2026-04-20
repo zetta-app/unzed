@@ -468,7 +468,47 @@ impl OpenAiEventMapper {
 
         match choice.finish_reason.as_deref() {
             Some("stop") => {
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                if self.tool_calls_by_index.is_empty() {
+                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
+                } else {
+                    log::info!(
+                        "OpenAI finish_reason is 'stop' but {} tool call(s) were streamed; \
+                         finalizing them (server likely uses 'stop' instead of 'tool_calls')",
+                        self.tool_calls_by_index.len()
+                    );
+                    events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
+                        match parse_tool_arguments(&tool_call.arguments) {
+                            Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
+                                LanguageModelToolUse {
+                                    id: tool_call.id.clone().into(),
+                                    name: tool_call.name.as_str().into(),
+                                    is_input_complete: true,
+                                    input,
+                                    raw_input: tool_call.arguments.clone(),
+                                    thought_signature: None,
+                                },
+                            )),
+                            Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
+                                id: tool_call.id.into(),
+                                tool_name: tool_call.name.into(),
+                                raw_input: tool_call.arguments.clone().into(),
+                                json_parse_error: error.to_string(),
+                            }),
+                        }
+                    }));
+                    events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
+                }
+            }
+            Some("length") => {
+                if !self.tool_calls_by_index.is_empty() {
+                    log::warn!(
+                        "OpenAI finish_reason is 'length' but {} tool call(s) were being streamed and will be dropped",
+                        self.tool_calls_by_index.len()
+                    );
+                }
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
             }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
@@ -1689,5 +1729,93 @@ mod tests {
                 .any(|e| matches!(e, LanguageModelCompletionEvent::Thinking { .. })),
             "OutputItemDone reasoning should not produce Thinking events"
         );
+    }
+
+    #[test]
+    fn chat_completions_stream_maps_length_finish_reason_to_max_tokens() {
+        let event = crate::ResponseStreamEvent {
+            choices: vec![crate::ChoiceDelta {
+                index: 0,
+                delta: Some(crate::ResponseMessageDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                }),
+                finish_reason: Some("length".into()),
+            }],
+            usage: None,
+        };
+
+        let mut mapper = OpenAiEventMapper::new();
+        let events = mapper.map_event(event);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].as_ref().unwrap(),
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens)
+        ));
+    }
+
+    #[test]
+    fn chat_completions_stream_finalizes_tool_calls_on_stop_finish_reason() {
+        let mut mapper = OpenAiEventMapper::new();
+
+        // First chunk: tool call id and function name
+        let event1 = crate::ResponseStreamEvent {
+            choices: vec![crate::ChoiceDelta {
+                index: 0,
+                delta: Some(crate::ResponseMessageDelta {
+                    role: Some(crate::Role::Assistant),
+                    content: None,
+                    tool_calls: Some(vec![crate::ToolCallChunk {
+                        index: 0,
+                        id: Some("call_123".into()),
+                        function: Some(crate::FunctionChunk {
+                            name: Some("get_weather".into()),
+                            arguments: Some("{\"city\":\"Seattle\"}".into()),
+                        }),
+                    }]),
+                    reasoning_content: None,
+                }),
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let events = mapper.map_event(event1);
+        // Should emit a partial ToolUse
+        assert!(events.iter().any(|e| matches!(
+            e.as_ref().unwrap(),
+            LanguageModelCompletionEvent::ToolUse(t) if !t.is_input_complete
+        )));
+
+        // Final chunk: finish_reason "stop" instead of "tool_calls"
+        // (this is what llama.cpp sends)
+        let event2 = crate::ResponseStreamEvent {
+            choices: vec![crate::ChoiceDelta {
+                index: 0,
+                delta: Some(crate::ResponseMessageDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                }),
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let events = mapper.map_event(event2);
+
+        // Should finalize the tool call with is_input_complete: true
+        let has_complete_tool_use = events.iter().any(|e| matches!(
+            e.as_ref().unwrap(),
+            LanguageModelCompletionEvent::ToolUse(t) if t.is_input_complete && t.name.as_ref() == "get_weather"
+        ));
+        assert!(has_complete_tool_use, "Expected finalized tool call with is_input_complete: true");
+
+        // Should emit ToolUse stop reason, not EndTurn
+        assert!(events.iter().any(|e| matches!(
+            e.as_ref().unwrap(),
+            LanguageModelCompletionEvent::Stop(StopReason::ToolUse)
+        )));
     }
 }

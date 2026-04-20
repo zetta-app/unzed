@@ -311,6 +311,7 @@ pub enum CompletionIntent {
     ToolResults,
     ThreadSummarization,
     ThreadContextSummarization,
+    ContextCompaction,
     CreateFile,
     EditFile,
     InlineAssist,

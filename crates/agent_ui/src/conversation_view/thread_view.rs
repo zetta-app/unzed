@@ -294,6 +294,7 @@ pub struct ThreadView {
     pub expanded_thinking_blocks: HashSet<(usize, usize)>,
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
+    pub expanded_compaction_summaries: HashSet<usize>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
@@ -539,6 +540,7 @@ impl ThreadView {
             expanded_thinking_blocks: HashSet::default(),
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
+            expanded_compaction_summaries: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
@@ -4799,6 +4801,9 @@ impl ThreadView {
             AgentThreadEntry::CompletedPlan(entries) => {
                 self.render_completed_plan(entries, window, cx)
             }
+            AgentThreadEntry::CompactionSummary(summary_entry) => {
+                self.render_compaction_summary(entry_ix, summary_entry, window, cx)
+            }
         };
 
         let is_subagent_output = self.is_subagent()
@@ -5353,6 +5358,104 @@ impl ThreadView {
         })
     }
 
+    pub fn compact_context(
+        &mut self,
+        _: &CompactContext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("ThreadView::compact_context action handler called");
+        if let Some(thread) = self.as_native_thread(cx) {
+            thread.update(cx, |thread, cx| {
+                thread.compact_context_forced(cx);
+            });
+        } else {
+            log::warn!("ThreadView::compact_context: no native thread");
+        }
+    }
+
+    pub fn view_compact_summary(
+        &self,
+        _: &ViewCompactSummary,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Task<Result<()>>> {
+        log::info!("ThreadView::view_compact_summary called");
+        let native_thread = self.as_native_thread(cx)?;
+        let summary = native_thread.read(cx).context_compact_summary()?.to_string();
+        let workspace = self.workspace.upgrade()?;
+
+        let markdown_language_task = workspace
+            .read(cx)
+            .app_state()
+            .languages
+            .language_for_name("Markdown");
+
+        let weak_thread = native_thread.downgrade();
+        let project = workspace.read(cx).project().clone();
+
+        Some(window.spawn(cx, async move |cx| {
+            let markdown_language = markdown_language_task.await?;
+
+            let buffer = project
+                .update(cx, |project, cx| {
+                    project.create_buffer(Some(markdown_language), false, cx)
+                })
+                .await?;
+
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_text(summary, cx);
+                buffer.set_capability(language::Capability::ReadWrite, cx);
+            });
+
+            let buffer_entity = buffer.clone();
+            workspace.update_in(cx, |workspace, window, cx| {
+                let multi_buffer = cx.new(|cx| {
+                    MultiBuffer::singleton(buffer_entity.clone(), cx)
+                        .with_title("Compacted Context Summary".to_string())
+                });
+
+                let editor_entity = cx.new(|cx| {
+                    let mut editor =
+                        Editor::for_multibuffer(multi_buffer, Some(project.clone()), window, cx);
+                    editor.set_breadcrumb_header("Compacted Context Summary".to_string());
+                    editor.disable_mouse_wheel_zoom();
+                    editor
+                });
+
+                let subscription = cx.subscribe(&editor_entity, {
+                    let weak_thread = weak_thread.clone();
+                    let buffer = buffer_entity.clone();
+                    move |_workspace, _editor, event: &editor::EditorEvent, cx| {
+                        if matches!(event, editor::EditorEvent::BufferEdited) {
+                            let new_text = buffer.read(cx).text();
+                            let summary = if new_text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(new_text)
+                            };
+                            weak_thread
+                                .update(cx, |thread, cx| {
+                                    thread.set_context_compact_summary(summary, cx);
+                                })
+                                .ok();
+                        }
+                    }
+                });
+                subscription.detach();
+
+                workspace.add_item_to_active_pane(
+                    Box::new(editor_entity),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            })?;
+            anyhow::Ok(())
+        }))
+    }
+
     pub(crate) fn sync_editor_mode_for_empty_state(&mut self, cx: &mut Context<Self>) {
         let has_messages = self.list_state.item_count() > 0;
         let v2_empty_state = !has_messages;
@@ -5579,6 +5682,86 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn render_compaction_summary(
+        &self,
+        entry_ix: usize,
+        summary: &acp_thread::CompactionSummaryEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let is_expanded = self.expanded_compaction_summaries.contains(&entry_ix);
+        let success_color = cx.theme().status().success;
+        let header_id = SharedString::from(format!("compaction-header-{}", entry_ix));
+
+        v_flex()
+            .px_5()
+            .py_1p5()
+            .w_full()
+            .child(
+                v_flex()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(success_color)
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .id(header_id)
+                            .px_2()
+                            .py_1()
+                            .bg(success_color.opacity(0.1))
+                            .w_full()
+                            .justify_between()
+                            .cursor_pointer()
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Success),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(self.tool_name_font_size())
+                                            .text_color(success_color)
+                                            .child("Context Compacted"),
+                                    ),
+                            )
+                            .child(
+                                Disclosure::new(("compaction-expand", entry_ix), is_expanded)
+                                    .opened_icon(IconName::ChevronUp)
+                                    .closed_icon(IconName::ChevronDown),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    if this.expanded_compaction_summaries.contains(&entry_ix) {
+                                        this.expanded_compaction_summaries.remove(&entry_ix);
+                                    } else {
+                                        this.expanded_compaction_summaries.insert(entry_ix);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .when(is_expanded, |this| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .py_1p5()
+                                .border_t_1()
+                                .border_color(success_color.opacity(0.3))
+                                .when_some(summary.block.markdown(), |this, md| {
+                                    this.child(self.render_markdown(
+                                        md.clone(),
+                                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                    ))
+                                }),
+                        )
+                    }),
+            )
+            .into_any()
+    }
+
     fn render_thinking_block(
         &self,
         entry_ix: usize,
@@ -5798,6 +5981,49 @@ impl ThreadView {
                             }
                         });
 
+                    let has_compact_summary = this
+                        .as_native_thread(cx)
+                        .as_ref()
+                        .and_then(|t| t.read(cx).context_compact_summary())
+                        .is_some();
+
+                    let compact_entry =
+                        ContextMenuEntry::new("Compact Context").handler({
+                            let entity = entity.clone();
+                            move |_, cx| {
+                                entity.update(cx, |this, cx| {
+                                    if let Some(thread) = this.as_native_thread(cx) {
+                                        thread.update(cx, |thread, cx| {
+                                            log::info!("Manually triggering context compaction from context menu");
+                                            thread.compact_context_forced(cx);
+                                        });
+                                    } else {
+                                        log::warn!("Compact Context: no native thread available");
+                                    }
+                                });
+                            }
+                        });
+
+                    let view_summary_entry =
+                        ContextMenuEntry::new("View Compact Summary")
+                            .disabled(!has_compact_summary)
+                            .handler({
+                                let entity = entity.clone();
+                                move |window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        if let Some(task) = this.view_compact_summary(
+                                            &ViewCompactSummary,
+                                            window,
+                                            cx,
+                                        ) {
+                                            task.detach_and_log_err(cx);
+                                        } else {
+                                            log::warn!("View Compact Summary: no summary or no native thread");
+                                        }
+                                    });
+                                }
+                            });
+
                     menu.when_some(focus, |menu, focus| menu.context(focus))
                         .action_disabled_when(
                             !has_selection,
@@ -5808,6 +6034,9 @@ impl ThreadView {
                         .separator()
                         .item(scroll_item)
                         .item(open_thread_as_markdown)
+                        .separator()
+                        .item(compact_entry)
+                        .item(view_summary_entry)
                 })
             })
             .into_any_element()
@@ -5891,7 +6120,8 @@ impl ThreadView {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::CompactionSummary(_) => {}
             }
         }
 
@@ -8628,6 +8858,179 @@ impl ThreadView {
             .into_any_element()
     }
 
+    fn render_rules_banner(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let thread = self.as_native_thread(cx)?;
+        let project_context = thread.read(cx).project_context().read(cx);
+
+        // Collect info about all worktrees that have available rules files.
+        let worktrees_with_rules: Vec<_> = project_context
+            .worktrees
+            .iter()
+            .filter(|wt| !wt.available_rules_files.is_empty())
+            .collect();
+
+        if worktrees_with_rules.is_empty() {
+            return None;
+        }
+
+        let mut children = Vec::new();
+        for worktree in &worktrees_with_rules {
+            let selected_name: SharedString = worktree
+                .rules_file
+                .as_ref()
+                .map(|rf| {
+                    SharedString::from(format!(
+                        "{}/{}",
+                        worktree.root_name,
+                        rf.path_in_worktree.as_unix_str()
+                    ))
+                })
+                .unwrap_or_else(|| "None".into());
+
+            let available_count = worktree.available_rules_files.len();
+            let root_name = worktree.root_name.clone();
+
+            // If there's only one rules file, just show it as a label.
+            if available_count == 1 {
+                children.push(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::Reader)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("Using rules: {}", selected_name))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+            } else {
+                // Multiple rules files available — show a dropdown.
+                let items: Vec<(usize, SharedString, bool)> = worktree
+                    .available_rules_files
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, rf)| {
+                        let label = SharedString::from(format!(
+                            "{}/{}",
+                            root_name, rf.path_in_worktree.as_unix_str()
+                        ));
+                        let is_selected = worktree.selected_rules_index == Some(idx);
+                        (idx, label, is_selected)
+                    })
+                    .collect();
+
+                let root_name_for_menu = root_name.clone();
+                let thread_entity = thread.clone();
+
+                children.push(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::Reader)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("Rules:")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            PopoverMenu::new(format!("rules-picker-{}", root_name))
+                                .trigger(
+                                    Button::new(
+                                        format!("rules-trigger-{}", root_name),
+                                        selected_name,
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                                .menu(move |window, cx| {
+                                    let items = items.clone();
+                                    let root_name = root_name_for_menu.clone();
+                                    let thread_entity = thread_entity.clone();
+
+                                    Some(ContextMenu::build(
+                                        window,
+                                        cx,
+                                        move |mut menu, _, _| {
+                                            for (idx, label, is_selected) in items.iter() {
+                                                let root_name = root_name.clone();
+                                                let thread_entity = thread_entity.clone();
+                                                let idx = *idx;
+                                                menu = menu.toggleable_entry(
+                                                    label.clone(),
+                                                    *is_selected,
+                                                    IconPosition::End,
+                                                    None,
+                                                    move |_window, cx| {
+                                                        let root_name = root_name.clone();
+                                                        thread_entity
+                                                            .update(cx, |thread, cx| {
+                                                                let path = thread
+                                                                    .project_context()
+                                                                    .read(cx)
+                                                                    .worktrees
+                                                                    .iter()
+                                                                    .find(|wt| {
+                                                                        wt.root_name == root_name
+                                                                    })
+                                                                    .and_then(|wt| {
+                                                                        wt.available_rules_files
+                                                                            .get(idx)
+                                                                    })
+                                                                    .map(|rf| {
+                                                                        rf.path_in_worktree.clone()
+                                                                    });
+                                                                if let Some(path) = path {
+                                                                    thread
+                                                                        .project_context()
+                                                                        .update(
+                                                                            cx,
+                                                                            |ctx, _cx| {
+                                                                                ctx.select_rules_file(
+                                                                                    &root_name,
+                                                                                    &path,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                    cx.notify();
+                                                                }
+                                                            });
+                                                    },
+                                                );
+                                            }
+                                            menu
+                                        },
+                                    ))
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        Some(
+            v_flex()
+                .px_4()
+                .py_1p5()
+                .gap_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().element_background)
+                .children(children)
+                .into_any_element(),
+        )
+    }
+
     fn update_recent_history_from_cache(
         &mut self,
         history: &Entity<ThreadHistory>,
@@ -8792,18 +9195,115 @@ impl ThreadView {
         let token_usage = self.thread.read(cx).token_usage()?;
         let ratio = token_usage.ratio();
 
+        let compact_config = &AgentSettings::get_global(cx).context_compact;
+        let compact_enabled = compact_config.enabled.unwrap_or(true);
+        let native_thread = self.as_native_thread(cx);
+        let is_compacting = native_thread
+            .as_ref()
+            .is_some_and(|t| t.read(cx).is_compacting());
+        let has_compact_summary = native_thread
+            .as_ref()
+            .is_some_and(|t| t.read(cx).context_compact_summary().is_some());
+
+        // If compaction just completed, show a success callout.
+        // Show it regardless of token ratio so manual compaction always gets feedback.
+        if has_compact_summary && !is_compacting {
+            let description = if let Some(thread) = &native_thread {
+                let thread = thread.read(cx);
+                let current = thread.message_count();
+                match thread.pre_compaction_message_count() {
+                    Some(previous) if previous > current => {
+                        format!(
+                            "Older messages were summarized to free up token space \
+                             ({previous} → {current} messages). \
+                             The conversation continues with full context."
+                        )
+                    }
+                    _ => {
+                        "Older messages were summarized to free up token space. \
+                         The conversation continues with full context."
+                            .to_string()
+                    }
+                }
+            } else {
+                "Older messages were summarized to free up token space. \
+                 The conversation continues with full context."
+                    .to_string()
+            };
+
+            return Some(
+                Callout::new()
+                    .severity(Severity::Success)
+                    .icon(IconName::Check)
+                    .title("Context compacted")
+                    .description(description)
+                    .dismiss_action(self.dismiss_error_button(cx)),
+            );
+        }
+
+        // If compaction is in progress, show an info callout
+        if is_compacting {
+            return Some(
+                Callout::new()
+                    .severity(Severity::Info)
+                    .icon(IconName::ArrowCircle)
+                    .title("Compacting context")
+                    .description(
+                        "Summarizing older messages to free up token space...",
+                    ),
+            );
+        }
+
         let (severity, icon, title) = match ratio {
             acp_thread::TokenUsageRatio::Normal => return None,
-            acp_thread::TokenUsageRatio::Warning => (
-                Severity::Warning,
-                IconName::Warning,
-                "Thread reaching the token limit soon",
-            ),
-            acp_thread::TokenUsageRatio::Exceeded => (
-                Severity::Error,
-                IconName::XCircle,
-                "Thread reached the token limit",
-            ),
+            acp_thread::TokenUsageRatio::Warning => {
+                if compact_enabled {
+                    if let Some(thread) = &native_thread {
+                        thread.update(cx, |thread, cx| {
+                            thread.compact_context(cx);
+                        });
+                        return Some(
+                            Callout::new()
+                                .severity(Severity::Info)
+                                .icon(IconName::ArrowCircle)
+                                .title("Compacting context")
+                                .description(
+                                    "Summarizing older messages to free up token space...",
+                                ),
+                        );
+                    }
+                }
+                (
+                    Severity::Warning,
+                    IconName::Warning,
+                    "Thread reaching the token limit soon",
+                )
+            }
+            acp_thread::TokenUsageRatio::Exceeded => {
+                if compact_enabled {
+                    if let Some(thread) = &native_thread {
+                        if !thread.read(cx).is_compacting() {
+                            thread.update(cx, |thread, cx| {
+                                thread.compact_context(cx);
+                            });
+                            return Some(
+                                Callout::new()
+                                    .severity(Severity::Info)
+                                    .icon(IconName::ArrowCircle)
+                                    .title("Compacting context")
+                                    .description(
+                                        "Summarizing older messages to free up token space...",
+                                    ),
+                            );
+                        }
+                    }
+                }
+                (
+                    Severity::Error,
+                    IconName::XCircle,
+                    "Thread reached the token limit",
+                )
+            }
         };
 
         let description = "To continue, start a new thread from a summary.";
@@ -8951,6 +9451,7 @@ impl Render for ThreadView {
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
+            .children(self.render_rules_banner(cx))
             .map(|this| {
                 if has_messages {
                     this.flex_1()
@@ -8991,6 +9492,12 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::handle_toggle_command_pattern))
             .on_action(cx.listener(Self::open_permission_dropdown))
             .on_action(cx.listener(Self::open_add_context_menu))
+            .on_action(cx.listener(Self::compact_context))
+            .on_action(cx.listener(|this, action: &ViewCompactSummary, window, cx| {
+                if let Some(task) = this.view_compact_summary(action, window, cx) {
+                    task.detach_and_log_err(cx);
+                }
+            }))
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
             .on_action(cx.listener(Self::scroll_output_line_up))
